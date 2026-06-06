@@ -1,0 +1,10 @@
+/node_modules
+dist/
+key.json
+.env
+.env.*
+!.env.example
+.vscode/
+FRONTEND_BILLING_GUIDE.md
+PAYMENT_SYSTEM.md
+ENV_SETUP.md
