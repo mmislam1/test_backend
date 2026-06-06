@@ -155,6 +155,7 @@ const paddleRequest = async (
   if (!apiKey) throw new Error('Paddle API key not configured.');
   const res = await axios({ method, url: `${paddleBase()}${path}`, data: body,
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' } });
+    console.log(res.data);
   return res.data;
 };
 
