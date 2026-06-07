@@ -6,8 +6,9 @@ import { Search } from '../../models/searches';
 import { User } from '../../models/users';
 import { Payment } from '../../models/payment';
 import { PLAN_DEFINITIONS, getPlanDefinition } from './billing.constants';
+import { syncPlanFromEnvByTier } from './plan-catalog.service';
 import type { PlanTier } from '../../models/plan';
-import type { BillingCycle } from '../../models/subscriptions';
+import type { BillingCycle, SubscriptionStatus } from '../../models/subscriptions';
 import { topUpCredits, topUpAlerts } from '../../common/helpers/alert.helper';
 import { evaluateSubscriptionAccess, pickEffectiveSubscription } from '../../common/helpers/subscription-access';
 
@@ -52,6 +53,121 @@ const pickBestPaddleSubscription = (subscriptions: any[]): any | undefined => {
     const bCreated = b?.created_at ? new Date(b.created_at).getTime() : 0;
     return bCreated - aCreated;
   })[0];
+};
+
+const PADDLE_SUBSCRIPTION_STATUS_MAP: Record<string, SubscriptionStatus> = {
+  active: 'active',
+  trialing: 'trialing',
+  paused: 'paused',
+  past_due: 'past_due',
+  canceled: 'cancelled',
+};
+
+const mapPaddleStatusToUserStatus = (
+  status: SubscriptionStatus,
+): 'active' | 'trialing' | 'past_due' | 'canceled' | 'paused' | undefined => {
+  if (status === 'cancelled') return 'canceled';
+  if (status === 'active' || status === 'trialing' || status === 'past_due' || status === 'paused') {
+    return status;
+  }
+  return undefined;
+};
+
+const syncLocalSubscriptionFromPaddle = async ({
+  userId,
+  subscriptionDocId,
+  paddleSubscription,
+}: {
+  userId: string;
+  subscriptionDocId: string;
+  paddleSubscription: any;
+}): Promise<boolean> => {
+  const paddlePriceId = paddleSubscription?.items?.[0]?.price?.id;
+  if (!paddleSubscription?.id || !paddlePriceId) {
+    return false;
+  }
+
+  const plan = await Plan.findOne({
+    $or: [
+      { paddleMonthlyPriceId: paddlePriceId },
+      { paddleAnnualPriceId: paddlePriceId },
+      { paddleTrialPriceId: paddlePriceId },
+    ],
+  });
+
+  if (!plan) {
+    console.warn('[Paddle Subscription Update] Could not map patched subscription price to a local plan.', {
+      userId,
+      paddleSubscriptionId: paddleSubscription.id,
+      paddlePriceId,
+    });
+    return false;
+  }
+
+  const status: SubscriptionStatus = PADDLE_SUBSCRIPTION_STATUS_MAP[paddleSubscription.status] ?? 'pending';
+  const billingCycle: BillingCycle = paddleSubscription.billing_cycle?.interval === 'year' ? 'annual' : 'monthly';
+  const periodEnd = paddleSubscription.current_billing_period?.ends_at
+    ? new Date(paddleSubscription.current_billing_period.ends_at)
+    : undefined;
+  const trialEnd = status === 'trialing' && paddleSubscription.next_billed_at
+    ? new Date(paddleSubscription.next_billed_at)
+    : undefined;
+  const scheduledCancel =
+    paddleSubscription.scheduled_change?.action === 'cancel' && paddleSubscription.scheduled_change?.effective_at
+      ? new Date(paddleSubscription.scheduled_change.effective_at)
+      : undefined;
+
+  const setFields: Record<string, unknown> = {
+    planId: plan._id,
+    billingCycle,
+    grantSource: status === 'trialing' ? 'trial' : 'paid',
+    status,
+    paddleSubscriptionId: paddleSubscription.id,
+    paddleCustomerId: paddleSubscription.customer_id,
+    ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
+    ...(trialEnd ? { trialEndDate: trialEnd } : {}),
+    ...(scheduledCancel ? { cancelDate: scheduledCancel } : {}),
+    ...(!scheduledCancel ? { autoRenewReminderStages: [] } : {}),
+    ...(!trialEnd ? { trialReminderStages: [] } : {}),
+  };
+
+  const unsetFields: Record<string, string> = {
+    ...(!scheduledCancel ? { cancelDate: '' } : {}),
+    ...(!trialEnd ? { trialEndDate: '' } : {}),
+  };
+
+  const updateDoc: Record<string, unknown> = { $set: setFields };
+  if (Object.keys(unsetFields).length > 0) {
+    updateDoc.$unset = unsetFields;
+  }
+
+  const subscription = await Subscription.findByIdAndUpdate(subscriptionDocId, updateDoc, { new: true });
+  if (!subscription) {
+    return false;
+  }
+
+  const userStatus = mapPaddleStatusToUserStatus(status);
+  await User.findByIdAndUpdate(userId, {
+    subscriptionId: subscription._id,
+    paddleCustomerId: paddleSubscription.customer_id,
+    paddleSubscriptionId: paddleSubscription.id,
+    ...(userStatus ? { subscriptionStatus: userStatus } : {}),
+  });
+
+  if (status === 'active') {
+    await Subscription.updateMany(
+      {
+        userId,
+        _id: { $ne: subscription._id },
+        status: { $in: ['active', 'trialing'] },
+      },
+      {
+        $set: { status: 'cancelled', cancelDate: new Date() },
+      },
+    );
+  }
+
+  return true;
 };
 
 const recoverLivePaddleSubscriptionId = async (userId: string): Promise<string | null> => {
@@ -155,7 +271,6 @@ const paddleRequest = async (
   if (!apiKey) throw new Error('Paddle API key not configured.');
   const res = await axios({ method, url: `${paddleBase()}${path}`, data: body,
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' } });
-    console.log(res.data);
   return res.data;
 };
 
@@ -352,26 +467,7 @@ export const subscribe = async (req: Request, res: Response) => {
     }
 
     const def = getPlanDefinition(tier);
-    const plan = await Plan.findOneAndUpdate(
-      { tier },
-      {
-        $set: {
-          name:                 def.name,
-          imageUploadLimit:     def.imageUploadLimit,
-          alertLimit:           def.alertLimit,
-          pdfEnabled:           def.pdfEnabled,
-          weeklyEmailAlerts:    def.weeklyEmailAlerts,
-          monthlyPrice:         def.pricing.monthly,
-          annualPrice:          def.pricing.annual,
-          paddleMonthlyPriceId: def.paddleMonthlyPriceId,
-          paddleAnnualPriceId:  def.paddleAnnualPriceId,
-          paddleTrialPriceId:   def.paddleTrialPriceId,
-          trialDays:            def.trialDays,
-        },
-        $setOnInsert: { tier },
-      },
-      { upsert: true, new: true },
-    );
+    const plan = await syncPlanFromEnvByTier(tier);
 
     // Carry over is automatic — user's credits/alertsRemaining balance persists.
     // Subscribing to a new plan simply adds the plan's quota on top.
@@ -615,13 +711,29 @@ export const updateSubscription = async (req: Request, res: Response) => {
       });
     }
 
-    await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, {
+    const updatedSubscriptionResponse = await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, {
       items:                   nextItems,
       proration_billing_mode:  'prorated_immediately',
     });
 
-    // Webhook subscription.updated will sync the final state; return immediately.
-    res.json({ success: true, message: `Subscription change to ${def.name} (${targetCycle}) submitted. Changes take effect immediately.` });
+    let syncedLocally = false;
+    try {
+      const updatedPaddleSubscription = updatedSubscriptionResponse?.data
+        ?? (await paddleRequest('get', `/subscriptions/${paddleSubscriptionId}`))?.data;
+      syncedLocally = await syncLocalSubscriptionFromPaddle({
+        userId,
+        subscriptionDocId: String(sub._id),
+        paddleSubscription: updatedPaddleSubscription,
+      });
+    } catch (syncErr: any) {
+      console.error('[Paddle Subscription Update] Local sync after patch failed.', JSON.stringify(syncErr?.response?.data ?? syncErr?.message, null, 2));
+    }
+
+    res.json({
+      success: true,
+      syncedLocally,
+      message: `Subscription change to ${def.name} (${targetCycle}) submitted. Changes take effect immediately.`,
+    });
   } catch (err: any) {
     console.error('[Paddle Subscription Update Error]', JSON.stringify(err?.response?.data ?? err?.message, null, 2));
     const msg = err?.response?.data?.error?.detail || err?.message || 'Server error';
