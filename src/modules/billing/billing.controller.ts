@@ -127,27 +127,90 @@ const syncLocalSubscriptionFromPaddle = async ({
     paddleSubscription.scheduled_change?.action === 'cancel' && paddleSubscription.scheduled_change?.effective_at
       ? new Date(paddleSubscription.scheduled_change.effective_at)
       : undefined;
+  const cancelDate = scheduledCancel
+    ?? (status === 'cancelled'
+      ? (paddleSubscription.canceled_at ? new Date(paddleSubscription.canceled_at) : new Date())
+      : undefined);
+
+  const existingSubscription = await Subscription.findById(subscriptionDocId)
+    .select('status currentPeriodEnd planId nextPlanId billingCycle nextBillingCycle')
+    .populate('planId', 'tier')
+    .populate('nextPlanId', 'tier')
+    .lean();
+
+  const previousPlan = (existingSubscription as any)?.planId as { _id?: string; tier?: PlanTier } | undefined;
+  const previousNextPlan = (existingSubscription as any)?.nextPlanId as { _id?: string; tier?: PlanTier } | undefined;
+  const previousTier = previousPlan?.tier as PlanTier | undefined;
+  const nextTier = plan.tier as PlanTier;
+  const periodAdvanced = didBillingPeriodAdvance((existingSubscription as any)?.currentPeriodEnd ?? null, periodEnd ?? null);
+  const hadPendingPlanChange =
+    (!!previousNextPlan?._id && String(previousNextPlan._id) !== String(previousPlan?._id)) ||
+    (!!(existingSubscription as any)?.nextBillingCycle && (existingSubscription as any).nextBillingCycle !== (existingSubscription as any).billingCycle);
+  const isImmediateUpgrade = isTierUpgrade(previousTier, nextTier);
+  const shouldStagePlanChange =
+    !scheduledCancel &&
+    !!previousPlan &&
+    !periodAdvanced &&
+    isTierDowngrade(previousTier, nextTier);
+  const shouldPreserveCurrentPlanOnCancel =
+    !!previousPlan &&
+    !!scheduledCancel &&
+    (hadPendingPlanChange || !isImmediateUpgrade);
+
+  console.log(`[Billing] syncLocalSubscriptionFromPaddle | decision=${safeSerializeForLog({
+    userId,
+    subscriptionDocId,
+    paddleSubscriptionId: paddleSubscription.id,
+    previousPlanTier: previousTier ?? null,
+    incomingPlanTier: nextTier,
+    previousBillingCycle: (existingSubscription as any)?.billingCycle ?? null,
+    incomingBillingCycle: billingCycle,
+    scheduledCancel: scheduledCancel?.toISOString() ?? null,
+    hadPendingPlanChange,
+    isImmediateUpgrade,
+    periodAdvanced,
+    shouldStagePlanChange,
+    shouldPreserveCurrentPlanOnCancel,
+  })}`);
 
   const setFields: Record<string, unknown> = {
-    planId: plan._id,
-    billingCycle,
     grantSource: status === 'trialing' ? 'trial' : 'paid',
     status,
     paddleSubscriptionId: paddleSubscription.id,
     paddleCustomerId: paddleSubscription.customer_id,
     ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
     ...(trialEnd ? { trialEndDate: trialEnd } : {}),
-    ...(scheduledCancel ? { cancelDate: scheduledCancel } : {}),
+    ...(cancelDate ? { cancelDate } : {}),
     ...(!scheduledCancel ? { autoRenewReminderStages: [] } : {}),
     ...(!trialEnd ? { trialReminderStages: [] } : {}),
   };
 
   const unsetFields: Record<string, string> = {
-    ...(!scheduledCancel ? { cancelDate: '' } : {}),
+    ...(!cancelDate ? { cancelDate: '' } : {}),
     ...(!trialEnd ? { trialEndDate: '' } : {}),
-    nextPlanId: '',
-    nextBillingCycle: '',
   };
+
+  if (shouldStagePlanChange) {
+    setFields.planId = previousPlan?._id ?? plan._id;
+    setFields.billingCycle = (existingSubscription as any)?.billingCycle ?? billingCycle;
+    setFields.nextPlanId = plan._id;
+    setFields.nextBillingCycle = billingCycle;
+  } else if (shouldPreserveCurrentPlanOnCancel) {
+    setFields.planId = previousPlan?._id ?? plan._id;
+    setFields.billingCycle = (existingSubscription as any)?.billingCycle ?? billingCycle;
+    unsetFields.nextPlanId = '';
+    unsetFields.nextBillingCycle = '';
+  } else {
+    setFields.planId = plan._id;
+    setFields.billingCycle = billingCycle;
+    unsetFields.nextPlanId = '';
+    unsetFields.nextBillingCycle = '';
+  }
+
+  if (scheduledCancel) {
+    unsetFields.nextPlanId = '';
+    unsetFields.nextBillingCycle = '';
+  }
 
   const updateDoc: Record<string, unknown> = { $set: setFields };
   if (Object.keys(unsetFields).length > 0) {
@@ -1331,7 +1394,7 @@ export const cancelSubscription = async (req: Request, res: Response) => {
       })}`);
 
       // Paddle-managed: send cancel request; let the webhook confirm cancellation.
-      await runPaddleMutationWithRecovery({
+      const paddleSubscriptionId = await runPaddleMutationWithRecovery({
         userId,
         localSubscriptionId: sub.paddleSubscriptionId,
         localSubscriptionDocId: sub._id,
@@ -1350,15 +1413,35 @@ export const cancelSubscription = async (req: Request, res: Response) => {
         },
       });
 
-      const effectiveAt = sub.nextBillingDate ?? sub.currentPeriodEnd ?? null;
-      const updateDoc: Record<string, any> = {
-        $unset: { nextPlanId: '', nextBillingCycle: '' },
-      };
-      if (effectiveAt) {
-        updateDoc.$set = { cancelDate: effectiveAt };
+      let effectiveAt = sub.nextBillingDate ?? sub.currentPeriodEnd ?? null;
+      let syncedLocally = false;
+
+      try {
+        const updatedPaddleSubscription = (await paddleRequest('get', `/subscriptions/${paddleSubscriptionId}`))?.data;
+        syncedLocally = await syncLocalSubscriptionFromPaddle({
+          userId,
+          subscriptionDocId: String(sub._id),
+          paddleSubscription: updatedPaddleSubscription,
+        });
+
+        if (updatedPaddleSubscription?.scheduled_change?.action === 'cancel' && updatedPaddleSubscription?.scheduled_change?.effective_at) {
+          effectiveAt = new Date(updatedPaddleSubscription.scheduled_change.effective_at);
+        }
+      } catch (syncErr: any) {
+        console.error('[Billing] cancelSubscription local sync failed', safeSerializeForLog(syncErr?.response?.data ?? syncErr?.message ?? syncErr));
       }
 
-      await Subscription.findByIdAndUpdate(sub._id, updateDoc);
+      if (!syncedLocally) {
+        const updateDoc: Record<string, any> = {
+          $set: { planId: sub.planId, billingCycle: sub.billingCycle },
+          $unset: { nextPlanId: '', nextBillingCycle: '' },
+        };
+        if (effectiveAt) {
+          updateDoc.$set.cancelDate = effectiveAt;
+        }
+
+        await Subscription.findByIdAndUpdate(sub._id, updateDoc);
+      }
 
       const effectiveAtText = formatBillingDate(effectiveAt);
       return res.json({
