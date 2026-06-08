@@ -91,7 +91,7 @@ export class PaddleService {
           autoRenewReminderStages: [],
           trialReminderStages: [],
         },
-        $unset: { nextPlanId: '', nextBillingCycle: '', cancelDate: '' },
+        $unset: { nextPlanId: '', nextBillingCycle: '', cancelDate: '', lockedPlanId: '', lockedBillingCycle: '' },
       },
       { upsert: true, new: true },
     );
@@ -191,7 +191,7 @@ export class PaddleService {
           ...(periodEnd && { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd }),
           ...(trialEnd && { trialEndDate: trialEnd }),
         },
-        $unset: { nextPlanId: '', nextBillingCycle: '', cancelDate: '' },
+        $unset: { nextPlanId: '', nextBillingCycle: '', cancelDate: '', lockedPlanId: '', lockedBillingCycle: '' },
       },
       { upsert: true, new: true },
     );
@@ -344,7 +344,7 @@ export class PaddleService {
           autoRenewReminderStages: [],
           trialReminderStages: [],
         },
-        $unset: { trialEndDate: '', nextPlanId: '', nextBillingCycle: '', cancelDate: '' },
+        $unset: { trialEndDate: '', nextPlanId: '', nextBillingCycle: '', cancelDate: '', lockedPlanId: '', lockedBillingCycle: '' },
       },
       { upsert: true, new: true },
     );
@@ -384,8 +384,9 @@ export class PaddleService {
   static async handleSubscriptionUpdated(data: any) {
     // userId must come from the existing subscription record — custom_data is absent on renewals
     const existingSub = await Subscription.findOne({ paddleSubscriptionId: data.id })
-      .select('userId planId nextPlanId billingCycle nextBillingCycle currentPeriodEnd status')
+      .select('userId planId lockedPlanId nextPlanId billingCycle lockedBillingCycle nextBillingCycle cancelDate currentPeriodEnd status')
       .populate('planId', 'tier name')
+      .populate('lockedPlanId', 'tier name')
       .populate('nextPlanId', 'tier name')
       .lean();
 
@@ -426,37 +427,49 @@ export class PaddleService {
     const trialEnd = newStatus === 'trialing' && data.next_billed_at
       ? new Date(data.next_billed_at)
       : undefined;
+    const existingCancelDate = existingSub?.cancelDate ? new Date(existingSub.cancelDate) : undefined;
+    const cancelDate = scheduledCancel
+      ?? (existingCancelDate && newStatus !== 'cancelled' ? existingCancelDate : undefined)
+      ?? (newStatus === 'cancelled'
+        ? (data.canceled_at ? new Date(data.canceled_at) : new Date())
+        : undefined);
     const previousPlan = existingSub?.planId as any;
+    const lockedPlan = existingSub?.lockedPlanId as any;
     const previousNextPlan = existingSub?.nextPlanId as any;
-    const previousTier = previousPlan?.tier as PlanTier | undefined;
+    const effectivePreviousPlan = lockedPlan ?? previousPlan;
+    const previousTier = effectivePreviousPlan?.tier as PlanTier | undefined;
     const nextTier = plan.tier as PlanTier;
+    const effectivePreviousBillingCycle = (existingSub?.lockedBillingCycle ?? existingSub?.billingCycle ?? billingCycle) as BillingCycle;
     const periodAdvanced = didBillingPeriodAdvance(existingSub?.currentPeriodEnd ?? null, periodEnd ?? null);
     const hadPendingPlanChange =
-      (!!previousNextPlan?._id && String(previousNextPlan._id) !== String(previousPlan?._id)) ||
-      (!!existingSub?.nextBillingCycle && existingSub.nextBillingCycle !== existingSub.billingCycle);
+      (!!previousNextPlan?._id && String(previousNextPlan._id) !== String(effectivePreviousPlan?._id)) ||
+      (!!existingSub?.nextBillingCycle && existingSub.nextBillingCycle !== effectivePreviousBillingCycle);
     const isImmediateUpgrade = isTierUpgrade(previousTier, nextTier);
+    const hasLockedCancelState = !!existingCancelDate && !!lockedPlan && newStatus !== 'cancelled';
     const shouldStagePlanChange =
-      !scheduledCancel &&
-      !!previousPlan &&
+      !cancelDate &&
+      !!effectivePreviousPlan &&
       !periodAdvanced &&
       isTierDowngrade(previousTier, nextTier);
     const shouldPreserveCurrentPlanOnCancel =
-      !!previousPlan &&
-      !!scheduledCancel &&
-      (hadPendingPlanChange || !isImmediateUpgrade);
-    const planChanged = !!previousPlan && String(previousPlan._id) !== String(plan._id);
-    const billingCycleChanged = !!existingSub?.billingCycle && existingSub.billingCycle !== billingCycle;
+      !!effectivePreviousPlan &&
+      ((!!scheduledCancel && (hadPendingPlanChange || !isImmediateUpgrade))
+        || (hasLockedCancelState && !isImmediateUpgrade));
+    const planChanged = !!effectivePreviousPlan && String(effectivePreviousPlan._id) !== String(plan._id);
+    const billingCycleChanged = !!effectivePreviousBillingCycle && effectivePreviousBillingCycle !== billingCycle;
 
     console.log(`[Paddle] subscription.updated | decision=${JSON.stringify({
       subId: data.id,
+      existingCancelDate: existingCancelDate?.toISOString() ?? null,
       previousPlanTier: previousTier ?? null,
       incomingPlanTier: nextTier,
-      previousBillingCycle: existingSub?.billingCycle ?? null,
+      previousBillingCycle: effectivePreviousBillingCycle,
       incomingBillingCycle: billingCycle,
       previousPeriodEnd: existingSub?.currentPeriodEnd ?? null,
       incomingPeriodEnd: periodEnd ?? null,
       scheduledCancel: scheduledCancel?.toISOString() ?? null,
       hadPendingPlanChange,
+      hasLockedCancelState,
       isImmediateUpgrade,
       periodAdvanced,
       shouldStagePlanChange,
@@ -471,23 +484,25 @@ export class PaddleService {
       status: newStatus,
       grantSource: newStatus === 'trialing' ? 'trial' : 'paid',
       ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
-      ...(scheduledCancel ? { cancelDate: scheduledCancel } : {}),
+      ...(cancelDate ? { cancelDate } : {}),
       ...(trialEnd ? { trialEndDate: trialEnd } : {}),
-      ...(!scheduledCancel ? { autoRenewReminderStages: [] } : {}),
+      ...(!cancelDate ? { autoRenewReminderStages: [] } : {}),
       ...(!trialEnd ? { trialReminderStages: [] } : {}),
     };
 
     const unsetFields: Record<string, string> = {
-      ...(!scheduledCancel ? { cancelDate: '' } : {}),
+      ...(!cancelDate ? { cancelDate: '' } : {}),
       ...(!trialEnd ? { trialEndDate: '' } : {}),
     };
 
     if (shouldStagePlanChange) {
+      setFields.planId = effectivePreviousPlan?._id ?? plan._id;
+      setFields.billingCycle = effectivePreviousBillingCycle;
       setFields.nextPlanId = plan._id;
       setFields.nextBillingCycle = billingCycle;
     } else if (shouldPreserveCurrentPlanOnCancel) {
-      setFields.planId = previousPlan._id;
-      setFields.billingCycle = existingSub?.billingCycle ?? billingCycle;
+      setFields.planId = effectivePreviousPlan?._id ?? plan._id;
+      setFields.billingCycle = effectivePreviousBillingCycle;
       unsetFields.nextPlanId = '';
       unsetFields.nextBillingCycle = '';
     } else {
@@ -497,9 +512,17 @@ export class PaddleService {
       unsetFields.nextBillingCycle = '';
     }
 
-    if (scheduledCancel) {
+    if (cancelDate) {
       unsetFields.nextPlanId = '';
       unsetFields.nextBillingCycle = '';
+    }
+
+    if (cancelDate && newStatus !== 'cancelled') {
+      setFields.lockedPlanId = setFields.planId;
+      setFields.lockedBillingCycle = setFields.billingCycle;
+    } else {
+      unsetFields.lockedPlanId = '';
+      unsetFields.lockedBillingCycle = '';
     }
 
     const updateDoc: Record<string, any> = { $set: setFields };
@@ -555,10 +578,10 @@ export class PaddleService {
       const renewedThroughText = formatBillingDate(periodEnd ?? null);
       let title = `Your subscription has been updated to ${plan.name} (${billingCycle}).`;
 
-      if (scheduledCancel) {
+      if (cancelDate && newStatus !== 'cancelled') {
         title = `Auto-renew is off. Your current plan stays active${scheduledAtText ? ` until ${scheduledAtText}` : ''}. No next plan is scheduled.${hadPendingPlanChange ? ' Any scheduled plan change was canceled.' : ''}`;
       } else if (shouldStagePlanChange) {
-        title = `Your plan will change to ${plan.name} (${billingCycle})${scheduledAtText ? ` on ${scheduledAtText}` : ' at the next billing date'}. Your current ${previousPlan?.name ?? 'plan'} stays active until then.`;
+        title = `Your plan will change to ${plan.name} (${billingCycle})${scheduledAtText ? ` on ${scheduledAtText}` : ' at the next billing date'}. Your current ${effectivePreviousPlan?.name ?? previousPlan?.name ?? 'plan'} stays active until then.`;
       } else if (hadPendingPlanChange && !periodAdvanced && !planChanged && !billingCycleChanged) {
         title = `Your renewal plan has been reset. ${plan.name} (${billingCycle}) will continue at the next billing date.`;
       } else if (periodAdvanced && hadPendingPlanChange) {
@@ -651,7 +674,7 @@ export class PaddleService {
           trialReminderStages: [],
           ...(periodEnd && { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd }),
         },
-        $unset: { cancelDate: '', nextPlanId: '', nextBillingCycle: '' },
+        $unset: { cancelDate: '', nextPlanId: '', nextBillingCycle: '', lockedPlanId: '', lockedBillingCycle: '' },
       },
       { new: true },
     );
@@ -684,7 +707,7 @@ export class PaddleService {
       { paddleSubscriptionId: data.id },
       {
         $set: { status: 'cancelled', cancelDate },
-        $unset: { nextPlanId: '', nextBillingCycle: '' },
+        $unset: { nextPlanId: '', nextBillingCycle: '', lockedPlanId: '', lockedBillingCycle: '' },
       },
       { new: true },
     );

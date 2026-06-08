@@ -6,8 +6,10 @@ export type SubscriptionStatus = 'active' | 'trialing' | 'cancelled' | 'expired'
 export interface ISubscription extends Document {
   userId: Types.ObjectId;
   planId: Types.ObjectId;
+  lockedPlanId?: Types.ObjectId;
   nextPlanId?: Types.ObjectId;
   billingCycle: BillingCycle;
+  lockedBillingCycle?: BillingCycle;
   nextBillingCycle?: BillingCycle;
   grantSource?: 'trial' | 'referral' | 'paid';
   activationDate: Date;
@@ -28,8 +30,10 @@ const SubscriptionSchema = new Schema<ISubscription>(
   {
     userId:               { type: Schema.Types.ObjectId, ref: 'User', required: true },
     planId:               { type: Schema.Types.ObjectId, ref: 'Plan', required: true },
+    lockedPlanId:         { type: Schema.Types.ObjectId, ref: 'Plan' },
     nextPlanId:           { type: Schema.Types.ObjectId, ref: 'Plan' },
     billingCycle:         { type: String, enum: ['monthly', 'annual'], default: 'monthly' },
+    lockedBillingCycle:   { type: String, enum: ['monthly', 'annual'] },
     nextBillingCycle:     { type: String, enum: ['monthly', 'annual'] },
     grantSource:          { type: String, enum: ['trial', 'referral', 'paid'], default: 'paid' },
     activationDate:       { type: Date, default: Date.now },
