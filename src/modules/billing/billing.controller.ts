@@ -39,6 +39,11 @@ const isPaddlePriceId = (value: string) => /^pri_[a-z\d]{26}$/i.test(value.trim(
 const isPaddleNotFoundError = (err: any): boolean =>
   err?.response?.data?.error?.code === 'not_found';
 
+const isPaddleScheduledChangeProrationConflict = (err: any): boolean => {
+  const detail = String(err?.response?.data?.error?.detail ?? '').toLowerCase();
+  return detail.includes('scheduled change') && detail.includes('proration_billing_mode');
+};
+
 const pickBestPaddleSubscription = (subscriptions: any[]): any | undefined => {
   if (!Array.isArray(subscriptions) || subscriptions.length === 0) return undefined;
 
@@ -806,10 +811,40 @@ export const updateSubscription = async (req: Request, res: Response) => {
       });
     }
 
-    const updatedSubscriptionResponse = await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, {
-      items: nextItems,
-      proration_billing_mode: shouldDeferToNextBillingPeriod ? 'full_next_billing_period' : 'prorated_immediately',
-    });
+    const deferredProrationBillingMode = hasPendingPlanChange
+      ? 'do_not_bill'
+      : 'full_next_billing_period';
+    const initialProrationBillingMode = shouldDeferToNextBillingPeriod
+      ? deferredProrationBillingMode
+      : 'prorated_immediately';
+
+    let updatedSubscriptionResponse: any;
+    try {
+      updatedSubscriptionResponse = await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, {
+        items: nextItems,
+        proration_billing_mode: initialProrationBillingMode,
+      });
+    } catch (err: any) {
+      const shouldRetryWithoutBilling =
+        shouldDeferToNextBillingPeriod &&
+        initialProrationBillingMode === 'full_next_billing_period' &&
+        isPaddleScheduledChangeProrationConflict(err);
+
+      if (!shouldRetryWithoutBilling) {
+        throw err;
+      }
+
+      console.warn('[Paddle Subscription Update] Retrying deferred change without billing because Paddle reports an existing scheduled change.', {
+        userId,
+        paddleSubscriptionId,
+        initialProrationBillingMode,
+      });
+
+      updatedSubscriptionResponse = await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, {
+        items: nextItems,
+        proration_billing_mode: 'do_not_bill',
+      });
+    }
 
     if (shouldDeferToNextBillingPeriod) {
       if (isRevertingToCurrentRenewal) {
