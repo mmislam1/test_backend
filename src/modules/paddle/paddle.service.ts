@@ -7,6 +7,7 @@ import { createUserAlert, topUpCredits, topUpAlerts } from '../../common/helpers
 import {
   didBillingPeriodAdvance,
   isTierDowngrade,
+  isTierUpgrade,
   shouldTopUpBalanceOnSubscriptionUpdate,
 } from '../billing/subscription-change.helpers';
 
@@ -433,6 +434,7 @@ export class PaddleService {
     const hadPendingPlanChange =
       (!!previousNextPlan?._id && String(previousNextPlan._id) !== String(previousPlan?._id)) ||
       (!!existingSub?.nextBillingCycle && existingSub.nextBillingCycle !== existingSub.billingCycle);
+    const isImmediateUpgrade = isTierUpgrade(previousTier, nextTier);
     const shouldStagePlanChange =
       !scheduledCancel &&
       !!previousPlan &&
@@ -441,7 +443,7 @@ export class PaddleService {
     const shouldPreserveCurrentPlanOnCancel =
       !!previousPlan &&
       !!scheduledCancel &&
-      (!periodAdvanced || hadPendingPlanChange);
+      (hadPendingPlanChange || !isImmediateUpgrade);
     const planChanged = !!previousPlan && String(previousPlan._id) !== String(plan._id);
     const billingCycleChanged = !!existingSub?.billingCycle && existingSub.billingCycle !== billingCycle;
 
@@ -455,6 +457,7 @@ export class PaddleService {
       incomingPeriodEnd: periodEnd ?? null,
       scheduledCancel: scheduledCancel?.toISOString() ?? null,
       hadPendingPlanChange,
+      isImmediateUpgrade,
       periodAdvanced,
       shouldStagePlanChange,
       shouldPreserveCurrentPlanOnCancel,
