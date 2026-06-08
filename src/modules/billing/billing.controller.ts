@@ -270,7 +270,7 @@ const recoverLivePaddleSubscriptionId = async (userId: string): Promise<string |
   return bestSubscription?.id ?? null;
 };
 
-const runPaddleMutationWithRecovery = async ({
+const runPaddleMutationWithRecovery = async <T>({
   userId,
   localSubscriptionId,
   localSubscriptionDocId,
@@ -281,11 +281,11 @@ const runPaddleMutationWithRecovery = async ({
   localSubscriptionId: string;
   localSubscriptionDocId: any;
   actionName: string;
-  execute: (subscriptionId: string) => Promise<void>;
-}): Promise<string> => {
+  execute: (subscriptionId: string) => Promise<T>;
+}): Promise<{ subscriptionId: string; result: T }> => {
   try {
-    await execute(localSubscriptionId);
-    return localSubscriptionId;
+    const result = await execute(localSubscriptionId);
+    return { subscriptionId: localSubscriptionId, result };
   } catch (err: any) {
     if (!isPaddleNotFoundError(err)) {
       throw err;
@@ -309,7 +309,7 @@ const runPaddleMutationWithRecovery = async ({
       throw recoveryError;
     }
 
-    await execute(recoveredSubscriptionId);
+    const result = await execute(recoveredSubscriptionId);
 
     await Promise.all([
       Subscription.findByIdAndUpdate(localSubscriptionDocId, { paddleSubscriptionId: recoveredSubscriptionId }),
@@ -322,7 +322,7 @@ const runPaddleMutationWithRecovery = async ({
       recoveredSubscriptionId,
     });
 
-    return recoveredSubscriptionId;
+    return { subscriptionId: recoveredSubscriptionId, result };
   }
 };
 
@@ -1394,7 +1394,7 @@ export const cancelSubscription = async (req: Request, res: Response) => {
       })}`);
 
       // Paddle-managed: send cancel request; let the webhook confirm cancellation.
-      const paddleSubscriptionId = await runPaddleMutationWithRecovery({
+      const { subscriptionId: paddleSubscriptionId, result: cancelMutationResponse } = await runPaddleMutationWithRecovery({
         userId,
         localSubscriptionId: sub.paddleSubscriptionId,
         localSubscriptionDocId: sub._id,
@@ -1407,18 +1407,19 @@ export const cancelSubscription = async (req: Request, res: Response) => {
             extraPatchFields: hasPendingPlanChange ? { scheduled_change: null } : undefined,
           });
 
-          await paddleRequest('post', `/subscriptions/${subscriptionId}/cancel`, {
+          return paddleRequest('post', `/subscriptions/${subscriptionId}/cancel`, {
             effective_from: 'next_billing_period',
           });
         },
       });
 
       let effectiveAt = sub.nextBillingDate ?? sub.currentPeriodEnd ?? null;
-      let syncedLocally = false;
 
       try {
-        const updatedPaddleSubscription = (await paddleRequest('get', `/subscriptions/${paddleSubscriptionId}`))?.data;
-        syncedLocally = await syncLocalSubscriptionFromPaddle({
+        const updatedPaddleSubscription = cancelMutationResponse?.data
+          ?? (await paddleRequest('get', `/subscriptions/${paddleSubscriptionId}`))?.data;
+
+        await syncLocalSubscriptionFromPaddle({
           userId,
           subscriptionDocId: String(sub._id),
           paddleSubscription: updatedPaddleSubscription,
@@ -1431,17 +1432,15 @@ export const cancelSubscription = async (req: Request, res: Response) => {
         console.error('[Billing] cancelSubscription local sync failed', safeSerializeForLog(syncErr?.response?.data ?? syncErr?.message ?? syncErr));
       }
 
-      if (!syncedLocally) {
-        const updateDoc: Record<string, any> = {
-          $set: { planId: sub.planId, billingCycle: sub.billingCycle },
-          $unset: { nextPlanId: '', nextBillingCycle: '' },
-        };
-        if (effectiveAt) {
-          updateDoc.$set.cancelDate = effectiveAt;
-        }
-
-        await Subscription.findByIdAndUpdate(sub._id, updateDoc);
+      const updateDoc: Record<string, any> = {
+        $set: { planId: sub.planId, billingCycle: sub.billingCycle },
+        $unset: { nextPlanId: '', nextBillingCycle: '' },
+      };
+      if (effectiveAt) {
+        updateDoc.$set.cancelDate = effectiveAt;
       }
+
+      await Subscription.findByIdAndUpdate(sub._id, updateDoc);
 
       const effectiveAtText = formatBillingDate(effectiveAt);
       return res.json({
