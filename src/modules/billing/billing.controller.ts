@@ -12,6 +12,7 @@ import type { BillingCycle, SubscriptionStatus } from '../../models/subscription
 import { topUpCredits, topUpAlerts } from '../../common/helpers/alert.helper';
 import { evaluateSubscriptionAccess, pickEffectiveSubscription } from '../../common/helpers/subscription-access';
 import {
+  didBillingPeriodAdvance,
   isTierDowngrade,
   isTierUpgrade,
   shouldTopUpBalanceOnSubscriptionUpdate,
@@ -283,6 +284,55 @@ const buildUpdatedSubscriptionItems = (items: any[], newPriceId: string) => {
     price_id: index === 0 ? newPriceId : item?.price?.id,
     quantity: Number(item?.quantity) > 0 ? Number(item.quantity) : 1,
   })).filter((item) => isPaddlePriceId(String(item.price_id)));
+};
+
+const getPlanPriceIdForCycle = (tier: PlanTier, billingCycle: BillingCycle): string => {
+  const definition = getPlanDefinition(tier);
+  const priceId = billingCycle === 'annual'
+    ? definition.paddleAnnualPriceId
+    : definition.paddleMonthlyPriceId;
+
+  if (!priceId || !isPaddlePriceId(priceId)) {
+    throw new Error(`Paddle price ID is not configured for ${tier} (${billingCycle}).`);
+  }
+
+  return priceId;
+};
+
+const syncPaddleRenewalToCurrentPlan = async ({
+  subscriptionId,
+  currentPlanTier,
+  currentBillingCycle,
+  extraPatchFields,
+}: {
+  subscriptionId: string;
+  currentPlanTier: PlanTier;
+  currentBillingCycle: BillingCycle;
+  extraPatchFields?: Record<string, unknown>;
+}): Promise<void> => {
+  const paddleSubscription = (await paddleRequest('get', `/subscriptions/${subscriptionId}`))?.data;
+  const currentItems = Array.isArray(paddleSubscription?.items) ? paddleSubscription.items : [];
+  const currentPriceId = getPlanPriceIdForCycle(currentPlanTier, currentBillingCycle);
+  const currentPaddlePriceId = String(currentItems[0]?.price?.id ?? '');
+  const patchBody: Record<string, unknown> = {
+    ...(extraPatchFields ?? {}),
+  };
+
+  if (currentPaddlePriceId !== currentPriceId) {
+    const nextItems = buildUpdatedSubscriptionItems(currentItems, currentPriceId);
+    if (nextItems.length === 0) {
+      throw new Error('Could not build Paddle subscription items for renewal reset.');
+    }
+
+    patchBody.items = nextItems;
+    patchBody.proration_billing_mode = 'do_not_bill';
+  }
+
+  if (Object.keys(patchBody).length === 0) {
+    return;
+  }
+
+  await paddleRequest('patch', `/subscriptions/${subscriptionId}`, patchBody);
 };
 
 /** Shared Paddle API client; throws on non-2xx with a cleaned error message. */
@@ -994,14 +1044,27 @@ export const resumeAutoRenew = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Subscription is not managed by Paddle.' });
     }
 
+    const currentPlan = await Plan.findById(sub.planId).select('tier').lean();
+    const currentPlanTier = currentPlan?.tier as PlanTier | undefined;
+    if (!currentPlanTier) {
+      return res.status(409).json({
+        success: false,
+        message: 'Current plan configuration could not be resolved.',
+        code: 'PLAN_NOT_FOUND',
+      });
+    }
+
     await runPaddleMutationWithRecovery({
       userId,
       localSubscriptionId: sub.paddleSubscriptionId,
       localSubscriptionDocId: sub._id,
       actionName: 'Paddle Resume Auto Renew',
       execute: async (subscriptionId: string) => {
-        await paddleRequest('patch', `/subscriptions/${subscriptionId}`, {
-          scheduled_change: null,
+        await syncPaddleRenewalToCurrentPlan({
+          subscriptionId,
+          currentPlanTier,
+          currentBillingCycle: sub.billingCycle,
+          extraPatchFields: { scheduled_change: null },
         });
       },
     });
@@ -1160,6 +1223,20 @@ export const cancelSubscription = async (req: Request, res: Response) => {
     }
 
     if (sub.paddleSubscriptionId) {
+      const currentPlan = await Plan.findById(sub.planId).select('tier').lean();
+      const currentPlanTier = currentPlan?.tier as PlanTier | undefined;
+      if (!currentPlanTier) {
+        return res.status(409).json({
+          success: false,
+          message: 'Current plan configuration could not be resolved.',
+          code: 'PLAN_NOT_FOUND',
+        });
+      }
+
+      const hasPendingPlanChange =
+        (!!sub.nextPlanId && String(sub.nextPlanId) !== String(sub.planId)) ||
+        (!!sub.nextBillingCycle && sub.nextBillingCycle !== sub.billingCycle);
+
       // Paddle-managed: send cancel request; let the webhook confirm cancellation.
       await runPaddleMutationWithRecovery({
         userId,
@@ -1167,6 +1244,12 @@ export const cancelSubscription = async (req: Request, res: Response) => {
         localSubscriptionDocId: sub._id,
         actionName: 'Paddle Cancel Subscription',
         execute: async (subscriptionId: string) => {
+          await syncPaddleRenewalToCurrentPlan({
+            subscriptionId,
+            currentPlanTier,
+            currentBillingCycle: sub.billingCycle,
+          });
+
           await paddleRequest('post', `/subscriptions/${subscriptionId}/cancel`, {
             effective_from: 'next_billing_period',
           });
@@ -1187,7 +1270,7 @@ export const cancelSubscription = async (req: Request, res: Response) => {
       return res.json({
         success: true,
         effectiveAt,
-        message: `Auto-renew turned off. Your subscription stays active${effectiveAtText ? ` until ${effectiveAtText}` : ' until the end of the current billing period'}. No next plan is scheduled.`,
+        message: `Auto-renew turned off. Your subscription stays active${effectiveAtText ? ` until ${effectiveAtText}` : ' until the end of the current billing period'}. No next plan is scheduled.${hasPendingPlanChange ? ' Any scheduled plan change was canceled.' : ''}`,
       });
     }
 
@@ -1291,27 +1374,90 @@ export const syncSubscriptionFromPaddle = async (req: Request, res: Response) =>
     const trialEnd = paddleSub.next_billed_at && status === 'trialing'
       ? new Date(paddleSub.next_billed_at)
       : undefined;
+    const scheduledCancel =
+      paddleSub.scheduled_change?.action === 'cancel' && paddleSub.scheduled_change?.effective_at
+        ? new Date(paddleSub.scheduled_change.effective_at)
+        : undefined;
+    const cancelDate = scheduledCancel
+      ?? (status === 'cancelled'
+        ? (paddleSub.canceled_at ? new Date(paddleSub.canceled_at) : new Date())
+        : undefined);
     const existingSubscription = await Subscription.findOne({ paddleSubscriptionId: paddleSub.id })
-      .select('status currentPeriodEnd planId')
+      .select('status activationDate currentPeriodEnd planId nextPlanId billingCycle nextBillingCycle')
       .populate('planId', 'tier')
+      .populate('nextPlanId', 'tier')
       .lean();
+    const previousPlan = (existingSubscription as any)?.planId as { _id?: string; tier?: PlanTier } | undefined;
+    const previousNextPlan = (existingSubscription as any)?.nextPlanId as { _id?: string; tier?: PlanTier } | undefined;
+    const previousTier = previousPlan?.tier as PlanTier | undefined;
+    const nextTier = plan.tier as PlanTier;
+    const periodAdvanced = didBillingPeriodAdvance((existingSubscription as any)?.currentPeriodEnd ?? null, periodEnd ?? null);
+    const hadPendingPlanChange =
+      (!!previousNextPlan?._id && String(previousNextPlan._id) !== String(previousPlan?._id)) ||
+      (!!(existingSubscription as any)?.nextBillingCycle && (existingSubscription as any).nextBillingCycle !== (existingSubscription as any).billingCycle);
+    const shouldStagePlanChange =
+      !scheduledCancel &&
+      !!previousPlan &&
+      !periodAdvanced &&
+      isTierDowngrade(previousTier, nextTier);
+    const shouldPreserveCurrentPlanOnCancel = !!previousPlan && !!scheduledCancel && !periodAdvanced;
+    const activePlanTier: PlanTier = shouldStagePlanChange || shouldPreserveCurrentPlanOnCancel
+      ? (previousTier ?? nextTier)
+      : nextTier;
+    const activeBillingCycle: BillingCycle = shouldStagePlanChange || shouldPreserveCurrentPlanOnCancel
+      ? ((existingSubscription as any)?.billingCycle ?? billingCycle)
+      : billingCycle;
+
+    const setFields: Record<string, unknown> = {
+      userId,
+      grantSource: status === 'trialing' ? 'trial' : 'paid',
+      status,
+      activationDate: (existingSubscription as any)?.activationDate
+        ?? (paddleSub.created_at ? new Date(paddleSub.created_at) : new Date()),
+      paddleSubscriptionId: paddleSub.id,
+      paddleCustomerId: paddleSub.customer_id,
+      ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
+      ...(trialEnd ? { trialEndDate: trialEnd } : {}),
+      ...(cancelDate ? { cancelDate } : {}),
+      ...(!scheduledCancel ? { autoRenewReminderStages: [] } : {}),
+      ...(!trialEnd ? { trialReminderStages: [] } : {}),
+    };
+    const unsetFields: Record<string, string> = {
+      ...(!cancelDate ? { cancelDate: '' } : {}),
+      ...(!trialEnd ? { trialEndDate: '' } : {}),
+    };
+
+    if (shouldStagePlanChange) {
+      setFields.planId = previousPlan?._id ?? plan._id;
+      setFields.billingCycle = (existingSubscription as any)?.billingCycle ?? billingCycle;
+      setFields.nextPlanId = plan._id;
+      setFields.nextBillingCycle = billingCycle;
+    } else if (shouldPreserveCurrentPlanOnCancel) {
+      setFields.planId = previousPlan?._id ?? plan._id;
+      setFields.billingCycle = (existingSubscription as any)?.billingCycle ?? billingCycle;
+      unsetFields.nextPlanId = '';
+      unsetFields.nextBillingCycle = '';
+    } else {
+      setFields.planId = plan._id;
+      setFields.billingCycle = billingCycle;
+      unsetFields.nextPlanId = '';
+      unsetFields.nextBillingCycle = '';
+    }
+
+    if (scheduledCancel) {
+      unsetFields.nextPlanId = '';
+      unsetFields.nextBillingCycle = '';
+    }
+
+    const updateDoc: Record<string, unknown> = { $set: setFields };
+    if (Object.keys(unsetFields).length > 0) {
+      updateDoc.$unset = unsetFields;
+    }
 
     const subscription = await Subscription.findOneAndUpdate(
       { paddleSubscriptionId: paddleSub.id },
-      {
-        userId,
-        planId: plan._id,
-        billingCycle,
-        grantSource: status === 'trialing' ? 'trial' : 'paid',
-        status,
-        activationDate: paddleSub.created_at ? new Date(paddleSub.created_at) : new Date(),
-        paddleSubscriptionId: paddleSub.id,
-        paddleCustomerId: paddleSub.customer_id,
-        ...(periodEnd && { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd }),
-        ...(trialEnd  && { trialEndDate: trialEnd }),
-        ...(status === 'cancelled' && { cancelDate: new Date() }),
-      },
-      { upsert: true, new: true },
+      updateDoc,
+      { upsert: true, new: true, setDefaultsOnInsert: true },
     );
 
     await User.findByIdAndUpdate(userId, {
@@ -1341,8 +1487,8 @@ export const syncSubscriptionFromPaddle = async (req: Request, res: Response) =>
       success: true,
       synced: true,
       status,
-      plan: plan.tier,
-      billingCycle,
+      plan: activePlanTier,
+      billingCycle: activeBillingCycle,
       paddleSubscriptionId: paddleSub.id,
     });
   } catch (err: any) {
