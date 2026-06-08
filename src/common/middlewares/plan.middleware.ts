@@ -70,6 +70,7 @@ export const planMiddleware = async (
       Subscription.findOne({ userId })
         .sort({ createdAt: -1 })
         .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
+        .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier')
         .lean(),
     ]);
 
@@ -112,7 +113,8 @@ export const planMiddleware = async (
       );
 
       if (hasAccess && effectiveStatus && SUB_ACCESS_STATUSES.includes(effectiveStatus)) {
-        const tier: PlanTier = (sub.planId as any)?.tier ?? 'starter';
+        const effectivePlanDoc = ((sub.cancelDate ? (sub as any).lockedPlanId : null) ?? (sub.planId as any)) as any;
+        const tier: PlanTier = effectivePlanDoc?.tier ?? 'starter';
         const planDef = getPlanDefinition(tier);
         await normalizeLegacyCredits(planDef.imageUploadLimit);
         await enforceMonthlyUploadLimit(planDef.imageUploadLimit);

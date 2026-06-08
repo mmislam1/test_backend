@@ -25,8 +25,11 @@ const getActivePlanTier = async (userId: string): Promise<PlanTier> => {
   const sub = await Subscription.findOne({
     userId,
     status: { $in: ['active', 'trialing'] },
-  }).populate<{ planId: { tier: PlanTier } }>('planId', 'tier');
-  return (sub?.planId as any)?.tier ?? 'starter';
+  })
+    .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
+    .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier');
+  const effectivePlanDoc = ((sub?.cancelDate ? (sub as any)?.lockedPlanId : null) ?? (sub?.planId as any)) as any;
+  return effectivePlanDoc?.tier ?? 'starter';
 };
 
 /** Build the Paddle base URL from the env. */
@@ -898,10 +901,12 @@ export const updateSubscription = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Subscription is not managed by Paddle. Use /billing/cancel and re-subscribe.' });
     }
 
-    const targetCycle: BillingCycle = billingCycle ?? (sub.billingCycle as BillingCycle);
+    const effectiveCurrentPlanId = sub.lockedPlanId ?? sub.planId;
+    const effectiveCurrentBillingCycle = (sub.lockedBillingCycle ?? sub.billingCycle) as BillingCycle;
+    const targetCycle: BillingCycle = billingCycle ?? effectiveCurrentBillingCycle;
     const def = getPlanDefinition(tier);
     const [currentPlan, targetPlan] = await Promise.all([
-      Plan.findById(sub.planId).select('tier name').lean(),
+      Plan.findById(effectiveCurrentPlanId).select('tier name').lean(),
       syncPlanFromEnvByTier(tier),
     ]);
 
@@ -934,14 +939,14 @@ export const updateSubscription = async (req: Request, res: Response) => {
     }
 
     const hasPendingPlanChange =
-      (!!sub.nextPlanId && String(sub.nextPlanId) !== String(sub.planId)) ||
-      (!!sub.nextBillingCycle && sub.nextBillingCycle !== sub.billingCycle);
+      (!!sub.nextPlanId && String(sub.nextPlanId) !== String(effectiveCurrentPlanId)) ||
+      (!!sub.nextBillingCycle && sub.nextBillingCycle !== effectiveCurrentBillingCycle);
     const currentRenewalPlanId = hasPendingPlanChange && sub.nextPlanId
       ? String(sub.nextPlanId)
-      : String(sub.planId);
+      : String(effectiveCurrentPlanId);
     const currentRenewalCycle = hasPendingPlanChange
-      ? (sub.nextBillingCycle ?? sub.billingCycle)
-      : sub.billingCycle;
+      ? (sub.nextBillingCycle ?? effectiveCurrentBillingCycle)
+      : effectiveCurrentBillingCycle;
 
     if (String(targetPlan._id) === currentRenewalPlanId && targetCycle === currentRenewalCycle) {
       return res.json({
@@ -961,8 +966,8 @@ export const updateSubscription = async (req: Request, res: Response) => {
       (hasPendingPlanChange && !isTierUpgrade(currentTier, targetPlan.tier as PlanTier));
     const isRevertingToCurrentRenewal =
       hasPendingPlanChange &&
-      String(targetPlan._id) === String(sub.planId) &&
-      targetCycle === sub.billingCycle;
+      String(targetPlan._id) === String(effectiveCurrentPlanId) &&
+      targetCycle === effectiveCurrentBillingCycle;
 
     let paddleSubscriptionId = sub.paddleSubscriptionId;
     let currentSubscriptionResponse: any;
@@ -1417,7 +1422,9 @@ export const cancelSubscription = async (req: Request, res: Response) => {
     }
 
     if (sub.paddleSubscriptionId) {
-      const currentPlan = await Plan.findById(sub.planId).select('tier').lean();
+      const effectiveCurrentPlanId = sub.lockedPlanId ?? sub.planId;
+      const effectiveCurrentBillingCycle = (sub.lockedBillingCycle ?? sub.billingCycle) as BillingCycle;
+      const currentPlan = await Plan.findById(effectiveCurrentPlanId).select('tier').lean();
       const currentPlanTier = currentPlan?.tier as PlanTier | undefined;
       if (!currentPlanTier) {
         return res.status(409).json({
@@ -1428,16 +1435,18 @@ export const cancelSubscription = async (req: Request, res: Response) => {
       }
 
       const hasPendingPlanChange =
-        (!!sub.nextPlanId && String(sub.nextPlanId) !== String(sub.planId)) ||
-        (!!sub.nextBillingCycle && sub.nextBillingCycle !== sub.billingCycle);
+        (!!sub.nextPlanId && String(sub.nextPlanId) !== String(effectiveCurrentPlanId)) ||
+        (!!sub.nextBillingCycle && sub.nextBillingCycle !== effectiveCurrentBillingCycle);
 
       console.log(`[Billing] cancelSubscription | ${safeSerializeForLog({
         userId,
         subscriptionId: sub._id,
         paddleSubscriptionId: sub.paddleSubscriptionId,
         planId: sub.planId,
+        lockedPlanId: sub.lockedPlanId ?? null,
         nextPlanId: sub.nextPlanId ?? null,
         billingCycle: sub.billingCycle,
+        lockedBillingCycle: sub.lockedBillingCycle ?? null,
         nextBillingCycle: sub.nextBillingCycle ?? null,
         currentPeriodEnd: sub.currentPeriodEnd ?? null,
         nextBillingDate: sub.nextBillingDate ?? null,
@@ -1454,7 +1463,7 @@ export const cancelSubscription = async (req: Request, res: Response) => {
           await syncPaddleRenewalToCurrentPlan({
             subscriptionId,
             currentPlanTier,
-            currentBillingCycle: sub.billingCycle,
+            currentBillingCycle: effectiveCurrentBillingCycle,
             extraPatchFields: hasPendingPlanChange ? { scheduled_change: null } : undefined,
           });
 
@@ -1485,10 +1494,10 @@ export const cancelSubscription = async (req: Request, res: Response) => {
 
       const updateDoc: Record<string, any> = {
         $set: {
-          planId: sub.planId,
-          billingCycle: sub.billingCycle,
-          lockedPlanId: sub.planId,
-          lockedBillingCycle: sub.billingCycle,
+          planId: effectiveCurrentPlanId,
+          billingCycle: effectiveCurrentBillingCycle,
+          lockedPlanId: effectiveCurrentPlanId,
+          lockedBillingCycle: effectiveCurrentBillingCycle,
         },
         $unset: { nextPlanId: '', nextBillingCycle: '' },
       };

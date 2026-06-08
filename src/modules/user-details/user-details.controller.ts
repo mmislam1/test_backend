@@ -20,9 +20,11 @@ const SETTINGS_USER_FIELDS =
 const getActivePlanTier = async (userId: string): Promise<PlanTier> => {
   const activeSubscription = await Subscription.findOne({ userId, status: 'active' }).populate<{
     planId: { tier: PlanTier };
-  }>('planId', 'tier');
+    lockedPlanId: { tier: PlanTier };
+  }>('planId', 'tier').populate('lockedPlanId', 'tier');
 
-  return (activeSubscription?.planId as any)?.tier ?? 'starter';
+  const effectivePlanDoc = ((activeSubscription?.cancelDate ? (activeSubscription as any)?.lockedPlanId : null) ?? (activeSubscription?.planId as any)) as any;
+  return effectivePlanDoc?.tier ?? 'starter';
 };
 
 const normalizeDateRange = (dateInput?: string) => {
