@@ -1248,6 +1248,7 @@ export const cancelSubscription = async (req: Request, res: Response) => {
             subscriptionId,
             currentPlanTier,
             currentBillingCycle: sub.billingCycle,
+            extraPatchFields: hasPendingPlanChange ? { scheduled_change: null } : undefined,
           });
 
           await paddleRequest('post', `/subscriptions/${subscriptionId}/cancel`, {

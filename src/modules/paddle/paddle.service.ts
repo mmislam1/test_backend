@@ -533,7 +533,7 @@ export class PaddleService {
       let title = `Your subscription has been updated to ${plan.name} (${billingCycle}).`;
 
       if (scheduledCancel) {
-        title = `Auto-renew is off. Your current plan stays active${scheduledAtText ? ` until ${scheduledAtText}` : ''}. No next plan is scheduled.`;
+        title = `Auto-renew is off. Your current plan stays active${scheduledAtText ? ` until ${scheduledAtText}` : ''}. No next plan is scheduled.${hadPendingPlanChange ? ' Any scheduled plan change was canceled.' : ''}`;
       } else if (shouldStagePlanChange) {
         title = `Your plan will change to ${plan.name} (${billingCycle})${scheduledAtText ? ` on ${scheduledAtText}` : ' at the next billing date'}. Your current ${previousPlan?.name ?? 'plan'} stays active until then.`;
       } else if (hadPendingPlanChange && !periodAdvanced && !planChanged && !billingCycleChanged) {

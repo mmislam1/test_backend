@@ -389,6 +389,15 @@ Typical Paddle-managed response:
 Frontend rules:
 - treat this as auto-renew off, not immediate plan loss
 - after success, show current plan still active, no renewal plan, and end date from `effectiveAt` or `cancelDate`
+- if the user already had a staged downgrade or billing-cycle change, remove that scheduled-change UI after success
+- show the response `message` in a toast/banner; when a staged change existed, the backend message now explicitly says it was canceled
+- invalidate and refetch `GET /billing/subscription` after success and expect:
+  - `autoRenewEnabled = false`
+  - `hasScheduledPlanChange = false`
+  - `nextPlan = null`
+  - `nextBillingCycle = null`
+  - `planChangeEffectiveAt = null`
+  - `cancelDate = effectiveAt`
 
 ### POST `/api/v1/billing/resume-auto-renew`
 
