@@ -810,13 +810,6 @@ export const updateSubscription = async (req: Request, res: Response) => {
     if (!sub.paddleSubscriptionId) {
       return res.status(400).json({ success: false, message: 'Subscription is not managed by Paddle. Use /billing/cancel and re-subscribe.' });
     }
-    if (sub.cancelDate) {
-      return res.status(409).json({
-        success: false,
-        message: 'Auto-renew is off. Resume auto-renew before changing the renewal plan.',
-        code: 'AUTO_RENEW_DISABLED',
-      });
-    }
 
     const targetCycle: BillingCycle = billingCycle ?? (sub.billingCycle as BillingCycle);
     const def = getPlanDefinition(tier);
@@ -827,6 +820,17 @@ export const updateSubscription = async (req: Request, res: Response) => {
 
     if (!currentPlan) {
       return res.status(422).json({ success: false, message: 'Current subscription plan could not be resolved.' });
+    }
+
+    const currentTier = currentPlan.tier as PlanTier;
+    const isImmediateUpgrade = isTierUpgrade(currentTier, targetPlan.tier as PlanTier);
+
+    if (sub.cancelDate && !isImmediateUpgrade) {
+      return res.status(409).json({
+        success: false,
+        message: 'Auto-renew is off. Resume auto-renew before changing the renewal plan.',
+        code: 'AUTO_RENEW_DISABLED',
+      });
     }
 
     const newPriceId = targetCycle === 'annual' ? def.paddleAnnualPriceId : def.paddleMonthlyPriceId;
@@ -864,7 +868,6 @@ export const updateSubscription = async (req: Request, res: Response) => {
       });
     }
 
-    const currentTier = currentPlan.tier as PlanTier;
     const isDowngrade = isTierDowngrade(currentTier, targetPlan.tier as PlanTier);
     const shouldDeferToNextBillingPeriod =
       isDowngrade ||
@@ -1017,7 +1020,7 @@ export const updateSubscription = async (req: Request, res: Response) => {
       syncedLocally,
       changeTiming: 'immediate',
       effectiveAt: new Date(),
-      message: `Subscription updated to ${def.name} (${targetCycle}). Changes take effect immediately.`,
+      message: `Subscription updated to ${def.name} (${targetCycle}). Changes take effect immediately.${sub.cancelDate ? ' Auto-renew remains off until the current billing period ends.' : ''}`,
     });
   } catch (err: any) {
     console.error('[Paddle Subscription Update Error]', JSON.stringify(err?.response?.data ?? err?.message, null, 2));

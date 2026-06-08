@@ -329,7 +329,8 @@ Behavior:
 - upgrades are immediate
 - downgrades are staged for next renewal
 - if a future change already exists, another PATCH can replace that staged renewal choice
-- if auto-renew is off, the endpoint is blocked
+- if auto-renew is off, immediate upgrades are still allowed and do not turn auto-renew back on
+- if auto-renew is off, deferred renewal-plan changes are blocked
 
 Common success response:
 
@@ -357,6 +358,7 @@ Important error cases:
 
 Frontend rules:
 - if `changeTiming === 'immediate'`, refresh current plan UI immediately
+- if `changeTiming === 'immediate'` and `subscription.autoRenewEnabled === false`, keep the upgraded current plan UI but continue showing the scheduled end date from `cancelDate`
 - if `changeTiming === 'next_billing_period'`, keep current plan UI unchanged and update only the renewal section
 - never assume a downgrade changes the live plan instantly
 
