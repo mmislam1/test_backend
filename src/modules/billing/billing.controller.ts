@@ -275,6 +275,60 @@ const formatBillingDate = (value?: Date | string | null): string | null => {
   });
 };
 
+const REDACTED_LOG_KEYS = /password|token|secret|authorization|email|signature|rawbody/i;
+
+const sanitizeForLog = (value: unknown): unknown => {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'bigint') return String(value);
+  if (Array.isArray(value)) return value.map((entry) => sanitizeForLog(entry));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => ([
+        key,
+        REDACTED_LOG_KEYS.test(key) ? '[REDACTED]' : sanitizeForLog(entry),
+      ])),
+    );
+  }
+  return value;
+};
+
+const safeSerializeForLog = (value: unknown, maxLength = 4000): string => {
+  try {
+    const serialized = JSON.stringify(sanitizeForLog(value));
+    return serialized.length > maxLength
+      ? `${serialized.slice(0, maxLength)}...<truncated ${serialized.length - maxLength} chars>`
+      : serialized;
+  } catch {
+    return String(value);
+  }
+};
+
+const summarizePaddlePayloadForLog = (payload: any) => {
+  const data = payload?.data ?? payload;
+  return {
+    id: data?.id ?? null,
+    status: data?.status ?? null,
+    customerId: data?.customer_id ?? null,
+    subscriptionId: data?.subscription_id ?? null,
+    billingCycle: data?.billing_cycle?.interval ?? null,
+    currentPeriodEnd: data?.current_billing_period?.ends_at ?? null,
+    nextBilledAt: data?.next_billed_at ?? null,
+    scheduledChange: data?.scheduled_change
+      ? {
+          action: data.scheduled_change.action ?? null,
+          effectiveAt: data.scheduled_change.effective_at ?? null,
+        }
+      : null,
+    items: Array.isArray(data?.items)
+      ? data.items.map((item: any) => ({
+          priceId: item?.price?.id ?? item?.price_id ?? null,
+          quantity: Number(item?.quantity ?? 1),
+        }))
+      : [],
+    requestId: payload?.meta?.request_id ?? null,
+  };
+};
+
 const buildUpdatedSubscriptionItems = (items: any[], newPriceId: string) => {
   if (!Array.isArray(items) || items.length === 0) {
     return [{ price_id: newPriceId, quantity: 1 }];
@@ -343,9 +397,32 @@ const paddleRequest = async (
 ) => {
   const apiKey = process.env.PADDLE_API_KEY?.trim();
   if (!apiKey) throw new Error('Paddle API key not configured.');
-  const res = await axios({ method, url: `${paddleBase()}${path}`, data: body,
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' } });
-  return res.data;
+
+  console.log(`[Paddle API] ${method.toUpperCase()} ${path} | request=${safeSerializeForLog(body ?? null)}`);
+
+  try {
+    const res = await axios({
+      method,
+      url: `${paddleBase()}${path}`,
+      data: body,
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    });
+
+    console.log(`[Paddle API] ${method.toUpperCase()} ${path} | response=${safeSerializeForLog({
+      status: res.status,
+      summary: summarizePaddlePayloadForLog(res.data),
+    })}`);
+
+    return res.data;
+  } catch (err: any) {
+    console.error(`[Paddle API] ${method.toUpperCase()} ${path} | error=${safeSerializeForLog({
+      status: err?.response?.status ?? null,
+      message: err?.message ?? 'Unknown Paddle API error',
+      request: body ?? null,
+      response: err?.response?.data?.error ?? err?.response?.data ?? null,
+    })}`);
+    throw err;
+  }
 };
 
 /** True when the user has never had a Paddle-managed subscription (trial eligible). */
@@ -1236,6 +1313,19 @@ export const cancelSubscription = async (req: Request, res: Response) => {
       const hasPendingPlanChange =
         (!!sub.nextPlanId && String(sub.nextPlanId) !== String(sub.planId)) ||
         (!!sub.nextBillingCycle && sub.nextBillingCycle !== sub.billingCycle);
+
+      console.log(`[Billing] cancelSubscription | ${safeSerializeForLog({
+        userId,
+        subscriptionId: sub._id,
+        paddleSubscriptionId: sub.paddleSubscriptionId,
+        planId: sub.planId,
+        nextPlanId: sub.nextPlanId ?? null,
+        billingCycle: sub.billingCycle,
+        nextBillingCycle: sub.nextBillingCycle ?? null,
+        currentPeriodEnd: sub.currentPeriodEnd ?? null,
+        nextBillingDate: sub.nextBillingDate ?? null,
+        hasPendingPlanChange,
+      })}`);
 
       // Paddle-managed: send cancel request; let the webhook confirm cancellation.
       await runPaddleMutationWithRecovery({

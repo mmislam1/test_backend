@@ -438,9 +438,29 @@ export class PaddleService {
       !!previousPlan &&
       !periodAdvanced &&
       isTierDowngrade(previousTier, nextTier);
-    const shouldPreserveCurrentPlanOnCancel = !!previousPlan && !!scheduledCancel && !periodAdvanced;
+    const shouldPreserveCurrentPlanOnCancel =
+      !!previousPlan &&
+      !!scheduledCancel &&
+      (!periodAdvanced || hadPendingPlanChange);
     const planChanged = !!previousPlan && String(previousPlan._id) !== String(plan._id);
     const billingCycleChanged = !!existingSub?.billingCycle && existingSub.billingCycle !== billingCycle;
+
+    console.log(`[Paddle] subscription.updated | decision=${JSON.stringify({
+      subId: data.id,
+      previousPlanTier: previousTier ?? null,
+      incomingPlanTier: nextTier,
+      previousBillingCycle: existingSub?.billingCycle ?? null,
+      incomingBillingCycle: billingCycle,
+      previousPeriodEnd: existingSub?.currentPeriodEnd ?? null,
+      incomingPeriodEnd: periodEnd ?? null,
+      scheduledCancel: scheduledCancel?.toISOString() ?? null,
+      hadPendingPlanChange,
+      periodAdvanced,
+      shouldStagePlanChange,
+      shouldPreserveCurrentPlanOnCancel,
+      planChanged,
+      billingCycleChanged,
+    })}`);
 
     // FIX: build $set and $unset as separate operators.
     // Mixing plain fields with $ operators in one document causes MongoDB to reject the update silently.

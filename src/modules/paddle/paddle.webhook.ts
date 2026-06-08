@@ -2,6 +2,23 @@ import { Request, Response } from 'express';
 import crypto from 'crypto';
 import { PaddleService } from './paddle.service';
 
+const summarizeWebhookData = (data: any) => ({
+  id: data?.id ?? null,
+  status: data?.status ?? null,
+  customerId: data?.customer_id ?? null,
+  subscriptionId: data?.subscription_id ?? null,
+  priceId: data?.items?.[0]?.price?.id ?? null,
+  billingCycle: data?.billing_cycle?.interval ?? null,
+  currentPeriodEnd: data?.current_billing_period?.ends_at ?? null,
+  nextBilledAt: data?.next_billed_at ?? null,
+  scheduledChange: data?.scheduled_change
+    ? {
+        action: data.scheduled_change.action ?? null,
+        effectiveAt: data.scheduled_change.effective_at ?? null,
+      }
+    : null,
+});
+
 const verifyPaddleSignature = (
   signatureHeader: string,
   rawBody: string,
@@ -62,7 +79,7 @@ export const handlePaddleWebhook = async (req: Request, res: Response): Promise<
     const eventType: string = event.event_type;
     const data = event.data;
 
-    console.log(`[Paddle] Received event: ${eventType}`);
+    console.log(`[Paddle] Received event: ${eventType} | summary=${JSON.stringify(summarizeWebhookData(data))}`);
 
     // Acknowledge receipt immediately — Paddle requires a 200 response within 5 seconds.
     // All business logic runs asynchronously below so we never time out.
@@ -112,6 +129,8 @@ export const handlePaddleWebhook = async (req: Request, res: Response): Promise<
           default:
             console.log(`[Paddle] Unhandled event type: ${eventType}`);
         }
+
+        console.log(`[Paddle] Completed event: ${eventType} | summary=${JSON.stringify(summarizeWebhookData(data))}`);
       } catch (error) {
         console.error(`[Paddle] Error processing event "${eventType}":`, error);
       }
