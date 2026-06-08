@@ -1489,12 +1489,16 @@ export const syncSubscriptionFromPaddle = async (req: Request, res: Response) =>
     const hadPendingPlanChange =
       (!!previousNextPlan?._id && String(previousNextPlan._id) !== String(previousPlan?._id)) ||
       (!!(existingSubscription as any)?.nextBillingCycle && (existingSubscription as any).nextBillingCycle !== (existingSubscription as any).billingCycle);
+    const isImmediateUpgrade = isTierUpgrade(previousTier, nextTier);
     const shouldStagePlanChange =
       !scheduledCancel &&
       !!previousPlan &&
       !periodAdvanced &&
       isTierDowngrade(previousTier, nextTier);
-    const shouldPreserveCurrentPlanOnCancel = !!previousPlan && !!scheduledCancel && !periodAdvanced;
+    const shouldPreserveCurrentPlanOnCancel =
+      !!previousPlan &&
+      !!scheduledCancel &&
+      (hadPendingPlanChange || !isImmediateUpgrade);
     const activePlanTier: PlanTier = shouldStagePlanChange || shouldPreserveCurrentPlanOnCancel
       ? (previousTier ?? nextTier)
       : nextTier;
