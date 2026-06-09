@@ -456,20 +456,20 @@ const getPlanPriceIdForCycle = (tier: PlanTier, billingCycle: BillingCycle): str
   return priceId;
 };
 
-const syncPaddleRenewalToCurrentPlan = async ({
+export const syncPaddleSubscriptionToPlan = async ({
   subscriptionId,
-  currentPlanTier,
-  currentBillingCycle,
+  planTier,
+  billingCycle,
   extraPatchFields,
 }: {
   subscriptionId: string;
-  currentPlanTier: PlanTier;
-  currentBillingCycle: BillingCycle;
+  planTier: PlanTier;
+  billingCycle: BillingCycle;
   extraPatchFields?: Record<string, unknown>;
-}): Promise<void> => {
+}): Promise<boolean> => {
   const paddleSubscription = (await paddleRequest('get', `/subscriptions/${subscriptionId}`))?.data;
   const currentItems = Array.isArray(paddleSubscription?.items) ? paddleSubscription.items : [];
-  const currentPriceId = getPlanPriceIdForCycle(currentPlanTier, currentBillingCycle);
+  const currentPriceId = getPlanPriceIdForCycle(planTier, billingCycle);
   const currentPaddlePriceId = String(currentItems[0]?.price?.id ?? '');
   const patchBody: Record<string, unknown> = {
     ...(extraPatchFields ?? {}),
@@ -478,7 +478,7 @@ const syncPaddleRenewalToCurrentPlan = async ({
   if (currentPaddlePriceId !== currentPriceId) {
     const nextItems = buildUpdatedSubscriptionItems(currentItems, currentPriceId);
     if (nextItems.length === 0) {
-      throw new Error('Could not build Paddle subscription items for renewal reset.');
+      throw new Error('Could not build Paddle subscription items for plan sync.');
     }
 
     patchBody.items = nextItems;
@@ -486,10 +486,11 @@ const syncPaddleRenewalToCurrentPlan = async ({
   }
 
   if (Object.keys(patchBody).length === 0) {
-    return;
+    return false;
   }
 
   await paddleRequest('patch', `/subscriptions/${subscriptionId}`, patchBody);
+  return true;
 };
 
 /** Shared Paddle API client; throws on non-2xx with a cleaned error message. */
@@ -1041,6 +1042,42 @@ export const updateSubscription = async (req: Request, res: Response) => {
       });
     }
 
+    if (shouldDeferToNextBillingPeriod) {
+      if (isRevertingToCurrentRenewal) {
+        await Subscription.findByIdAndUpdate(sub._id, {
+          $unset: { nextPlanId: '', nextBillingCycle: '' },
+        });
+      } else {
+        await Subscription.findByIdAndUpdate(sub._id, {
+          $set: { nextPlanId: targetPlan._id, nextBillingCycle: targetCycle },
+        });
+      }
+
+      console.log('[Paddle Subscription Update] Deferred plan change stored locally without mutating Paddle subscription items.', {
+        userId,
+        paddleSubscriptionId,
+        currentPlanId: String(effectiveCurrentPlanId),
+        currentBillingCycle: effectiveCurrentBillingCycle,
+        targetPlanId: String(targetPlan._id),
+        targetBillingCycle: targetCycle,
+        isRevertingToCurrentRenewal,
+      });
+
+      const effectiveAt = sub.nextBillingDate ?? sub.currentPeriodEnd ?? null;
+      const effectiveAtText = formatBillingDate(effectiveAt);
+
+      return res.json({
+        success: true,
+        syncedLocally: false,
+        changeTiming: 'next_billing_period',
+        effectiveAt,
+        message: isRevertingToCurrentRenewal
+          ? `Renewal plan reset. ${currentPlan.name} (${sub.billingCycle}) will continue${effectiveAtText ? ` on ${effectiveAtText}` : ' at the next billing date'}.`
+          : `Downgrade to ${def.name} (${targetCycle}) scheduled${effectiveAtText ? ` for ${effectiveAtText}` : ' for the next billing date'}. Your current ${currentPlan.name} plan, access, and remaining credits stay unchanged until then.`,
+        paddleSubscriptionId,
+      });
+    }
+
     const nextItems = buildUpdatedSubscriptionItems(currentItems, String(newPriceId));
 
     if (nextItems.length === 0) {
@@ -1082,32 +1119,6 @@ export const updateSubscription = async (req: Request, res: Response) => {
       updatedSubscriptionResponse = await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, {
         items: nextItems,
         proration_billing_mode: 'do_not_bill',
-      });
-    }
-
-    if (shouldDeferToNextBillingPeriod) {
-      if (isRevertingToCurrentRenewal) {
-        await Subscription.findByIdAndUpdate(sub._id, {
-          $unset: { nextPlanId: '', nextBillingCycle: '' },
-        });
-      } else {
-        await Subscription.findByIdAndUpdate(sub._id, {
-          $set: { nextPlanId: targetPlan._id, nextBillingCycle: targetCycle },
-        });
-      }
-
-      const effectiveAt = sub.nextBillingDate ?? sub.currentPeriodEnd ?? null;
-      const effectiveAtText = formatBillingDate(effectiveAt);
-
-      return res.json({
-        success: true,
-        syncedLocally: false,
-        changeTiming: 'next_billing_period',
-        effectiveAt,
-        message: isRevertingToCurrentRenewal
-          ? `Renewal plan reset. ${currentPlan.name} (${sub.billingCycle}) will continue${effectiveAtText ? ` on ${effectiveAtText}` : ' at the next billing date'}.`
-          : `Downgrade to ${def.name} (${targetCycle}) scheduled${effectiveAtText ? ` for ${effectiveAtText}` : ' for the next billing date'}. Your current ${currentPlan.name} plan, access, and remaining credits stay unchanged until then.`,
-        paddleSubscriptionId: updatedSubscriptionResponse?.data?.id ?? paddleSubscriptionId,
       });
     }
 
@@ -1273,10 +1284,10 @@ export const resumeAutoRenew = async (req: Request, res: Response) => {
       localSubscriptionDocId: sub._id,
       actionName: 'Paddle Resume Auto Renew',
       execute: async (subscriptionId: string) => {
-        await syncPaddleRenewalToCurrentPlan({
+        await syncPaddleSubscriptionToPlan({
           subscriptionId,
-          currentPlanTier,
-          currentBillingCycle,
+          planTier: currentPlanTier,
+          billingCycle: currentBillingCycle,
           extraPatchFields: { scheduled_change: null },
         });
       },
@@ -1471,10 +1482,10 @@ export const cancelSubscription = async (req: Request, res: Response) => {
         localSubscriptionDocId: sub._id,
         actionName: 'Paddle Cancel Subscription',
         execute: async (subscriptionId: string) => {
-          await syncPaddleRenewalToCurrentPlan({
+          await syncPaddleSubscriptionToPlan({
             subscriptionId,
-            currentPlanTier,
-            currentBillingCycle: effectiveCurrentBillingCycle,
+            planTier: currentPlanTier,
+            billingCycle: effectiveCurrentBillingCycle,
             extraPatchFields: hasPendingPlanChange ? { scheduled_change: null } : undefined,
           });
 

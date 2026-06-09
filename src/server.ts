@@ -5,6 +5,7 @@ import dns from "dns";
 import { startWeeklyRescanWorker } from './modules/notifications/weekly-rescan.worker';
 import { startTrialExpiryWorker } from './modules/billing/trial-expiry.worker';
 import { startAutoRenewReminderWorker } from './modules/billing/auto-renew-reminder.worker';
+import { startPendingPlanChangeWorker } from './modules/billing/pending-plan-change.worker';
 import { startTrialReminderWorker } from './modules/billing/trial-reminder.worker';
 import { syncPlanCatalogFromEnv } from './modules/billing/plan-catalog.service';
 
@@ -59,6 +60,7 @@ const bootstrap = async () => {
       startWeeklyRescanWorker();
       startTrialExpiryWorker();
       startAutoRenewReminderWorker();
+      startPendingPlanChangeWorker();
       startTrialReminderWorker();
     });
   } catch (err) {
