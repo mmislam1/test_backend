@@ -37,24 +37,34 @@ export class PaddleService {
 
   /**
    * Resolve userId from custom_data first; fall back to fetching it from the
-   * existing Subscription document keyed on Paddle's subscription ID.
-   * This covers renewal transactions where custom_data is empty.
+   * existing Subscription document keyed on Paddle's subscription ID, then
+   * the cached Paddle customer ID on the user.
+   * This covers renewal transactions where custom_data is empty and checkout
+   * flows where Paddle omits custom_data on later subscription lifecycle events.
    */
   private static async resolveUserId(
     customData: Record<string, any>,
     paddleSubscriptionId?: string,
+    paddleCustomerId?: string,
   ): Promise<string | undefined> {
     if (customData.userId) return customData.userId as string;
     if (paddleSubscriptionId) {
       const sub = await Subscription.findOne({ paddleSubscriptionId }).select('userId').lean();
-      return sub?.userId?.toString();
+      const userId = sub?.userId?.toString();
+      if (userId) return userId;
     }
+
+    if (paddleCustomerId) {
+      const user = await User.findOne({ paddleCustomerId }).select('_id').lean();
+      return (user as any)?._id?.toString();
+    }
+
     return undefined;
   }
 
   static async handleSubscriptionTrialing(data: any) {
     const customData = data.custom_data || {};
-    const userId = await this.resolveUserId(customData, data.id);
+    const userId = await this.resolveUserId(customData, data.id, data.customer_id);
     if (!userId) throw new Error(`[Paddle] subscription.trialing: could not resolve userId for sub ${data.id}`);
 
     const paddlePriceId = data.items[0].price.id;
@@ -130,7 +140,7 @@ export class PaddleService {
    */
   static async handleSubscriptionCreated(data: any) {
     const customData = data.custom_data || {};
-    const userId = await this.resolveUserId(customData, data.id);
+    const userId = await this.resolveUserId(customData, data.id, data.customer_id);
     if (!userId) {
       // custom_data may be absent for imported/API-created subscriptions — warn and let
       // the subsequent activated/trialing event handle it.
@@ -219,7 +229,7 @@ export class PaddleService {
     }
 
     // Resolve userId — may be absent on renewal transactions
-    const userId = await this.resolveUserId(customData, data.subscription_id);
+    const userId = await this.resolveUserId(customData, data.subscription_id, data.customer_id);
     if (!userId) {
       console.warn(`[Paddle] transaction.completed: could not resolve userId for tx ${data.id}`);
       return;
@@ -245,7 +255,7 @@ export class PaddleService {
     const customData = data.custom_data || {};
 
     // Idempotency: upsert so retried webhooks don't create duplicate records
-    const userId = await this.resolveUserId(customData, data.subscription_id);
+    const userId = await this.resolveUserId(customData, data.subscription_id, data.customer_id);
     if (!userId) {
       console.warn(`[Paddle] transaction.payment_failed: could not resolve userId for tx ${data.id}`);
       return;
@@ -305,7 +315,7 @@ export class PaddleService {
 
   static async handleSubscriptionActivated(data: any) {
     const customData = data.custom_data || {};
-    const userId = await this.resolveUserId(customData, data.id);
+    const userId = await this.resolveUserId(customData, data.id, data.customer_id);
     if (!userId) throw new Error(`[Paddle] subscription.activated: could not resolve userId for sub ${data.id}`);
 
     const paddlePriceId = data.items[0].price.id;
