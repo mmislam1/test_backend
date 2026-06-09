@@ -27,7 +27,7 @@ import { getPlanDefinition, type PlanDefinition } from '../../modules/billing/bi
 import { AppError } from '../errors/AppError';
 import { StatusCodes } from 'http-status-codes';
 import type { PlanTier } from '../../models/plan';
-import { evaluateSubscriptionAccess } from '../helpers/subscription-access';
+import { evaluateSubscriptionAccess, pickEffectiveSubscription } from '../helpers/subscription-access';
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -66,8 +66,9 @@ export const planMiddleware = async (
 
     // Fetch user doc and most-recent subscription in parallel
     const [user, sub] = await Promise.all([
-      User.findById(userId).select('isActive subscriptionStatus credits').lean(),
-      Subscription.findOne({ userId })
+      User.findById(userId).select('isActive subscriptionStatus credits paddleSubscriptionId').lean(),
+      Subscription.find({ userId })
+        .sort({ activationDate: -1, createdAt: -1 })
         .sort({ createdAt: -1 })
         .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
         .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier')
@@ -106,14 +107,18 @@ export const planMiddleware = async (
     };
 
     // ── 1. Subscription document status + real-time period checks ───────
-    if (sub) {
+    const effectiveSub = pickEffectiveSubscription(sub as any[], {
+      preferredSubscriptionId: (user as any)?.paddleSubscriptionId,
+    });
+
+    if (effectiveSub) {
       const { effectiveStatus, hasAccess } = evaluateSubscriptionAccess(
-        sub as any,
+        effectiveSub as any,
         user.subscriptionStatus ?? null,
       );
 
       if (hasAccess && effectiveStatus && SUB_ACCESS_STATUSES.includes(effectiveStatus)) {
-        const effectivePlanDoc = ((sub.cancelDate ? (sub as any).lockedPlanId : null) ?? (sub.planId as any)) as any;
+        const effectivePlanDoc = ((effectiveSub.cancelDate ? (effectiveSub as any).lockedPlanId : null) ?? (effectiveSub.planId as any)) as any;
         const tier: PlanTier = effectivePlanDoc?.tier ?? 'starter';
         const planDef = getPlanDefinition(tier);
         await normalizeLegacyCredits(planDef.imageUploadLimit);

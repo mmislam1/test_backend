@@ -22,14 +22,31 @@ import {
 
 /** Returns the active/trialing plan tier for a user, defaulting to 'starter'. */
 const getActivePlanTier = async (userId: string): Promise<PlanTier> => {
-  const sub = await Subscription.findOne({
+  const subscriptions = await Subscription.find({
     userId,
     status: { $in: ['active', 'trialing'] },
   })
+    .sort({ activationDate: -1, createdAt: -1 })
     .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
-    .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier');
+    .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier')
+    .lean();
+  const sub = pickEffectiveSubscription(subscriptions as any[]);
   const effectivePlanDoc = ((sub?.cancelDate ? (sub as any)?.lockedPlanId : null) ?? (sub?.planId as any)) as any;
   return effectivePlanDoc?.tier ?? 'starter';
+};
+
+const findEffectiveSubscriptionForUser = async (
+  userId: string,
+  statuses: SubscriptionStatus[],
+): Promise<any | null> => {
+  const subscriptions = await Subscription.find({
+    userId,
+    status: { $in: statuses },
+  })
+    .sort({ activationDate: -1, createdAt: -1 })
+    .lean();
+
+  return pickEffectiveSubscription(subscriptions as any[]);
 };
 
 /** Build the Paddle base URL from the env. */
@@ -893,7 +910,7 @@ export const updateSubscription = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Invalid plan tier.' });
     }
 
-    const sub = await Subscription.findOne({ userId, status: { $in: ['active', 'trialing'] } });
+    const sub = await findEffectiveSubscriptionForUser(userId, ['active', 'trialing']);
     if (!sub) {
       return res.status(404).json({ success: false, message: 'No active subscription found.' });
     }
@@ -1161,7 +1178,7 @@ export const pauseSubscription = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
 
-    const sub = await Subscription.findOne({ userId, status: 'active' });
+    const sub = await findEffectiveSubscriptionForUser(userId, ['active']);
     if (!sub) {
       return res.status(404).json({ success: false, message: 'No active subscription found.' });
     }
@@ -1188,7 +1205,7 @@ export const resumeSubscription = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
 
-    const sub = await Subscription.findOne({ userId, status: 'paused' });
+    const sub = await findEffectiveSubscriptionForUser(userId, ['paused']);
     if (!sub) {
       return res.status(404).json({ success: false, message: 'No paused subscription found.' });
     }
@@ -1230,10 +1247,7 @@ export const resumeAutoRenew = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
 
-    const sub = await Subscription.findOne({
-      userId,
-      status: { $in: ['active', 'trialing', 'past_due'] },
-    });
+    const sub = await findEffectiveSubscriptionForUser(userId, ['active', 'trialing', 'past_due']);
     if (!sub) {
       return res.status(404).json({ success: false, message: 'No renewable subscription found.' });
     }
@@ -1413,10 +1427,7 @@ export const cancelSubscription = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
 
-    const sub = await Subscription.findOne({
-      userId,
-      status: { $in: ['active', 'trialing', 'past_due'] },
-    });
+    const sub = await findEffectiveSubscriptionForUser(userId, ['active', 'trialing', 'past_due']);
     if (!sub) {
       return res.status(404).json({ success: false, message: 'No active subscription found.' });
     }

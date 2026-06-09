@@ -12,16 +12,22 @@ import { getPlanDefinition } from '../billing/billing.constants';
 import type { PlanTier } from '../../models/plan';
 import { normalizeStoredResultDetails } from '../../common/helpers/result-normalizer';
 import { sendAdminResultStatusChangeEmail } from '../notifications/notification-email.service';
+import { pickEffectiveSubscription } from '../../common/helpers/subscription-access';
 
 const REVIEWED_STATUSES = ['takedown_request', 'report_infringement', 'dispute', 'legal_support_request'];
 const SETTINGS_USER_FIELDS =
   'name email affiliation jobTitle country phoneNumber role joiningDate notificationSettings';
 
 const getActivePlanTier = async (userId: string): Promise<PlanTier> => {
-  const activeSubscription = await Subscription.findOne({ userId, status: 'active' }).populate<{
-    planId: { tier: PlanTier };
-    lockedPlanId: { tier: PlanTier };
-  }>('planId', 'tier').populate('lockedPlanId', 'tier');
+  const subscriptions = await Subscription.find({ userId, status: { $in: ['active', 'trialing', 'past_due'] } })
+    .sort({ activationDate: -1, createdAt: -1 })
+    .populate<{
+      planId: { tier: PlanTier };
+      lockedPlanId: { tier: PlanTier };
+    }>('planId', 'tier')
+    .populate('lockedPlanId', 'tier');
+
+  const activeSubscription = pickEffectiveSubscription(subscriptions as any[]);
 
   const effectivePlanDoc = ((activeSubscription?.cancelDate ? (activeSubscription as any)?.lockedPlanId : null) ?? (activeSubscription?.planId as any)) as any;
   return effectivePlanDoc?.tier ?? 'starter';

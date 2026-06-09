@@ -9,14 +9,18 @@ import { generateSearchPdf } from './reports.service';
 import { sendReportEmail } from './email.service'; // Your existing email logic
 import { getPlanDefinition } from '../billing/billing.constants';
 import type { PlanTier } from '../../models/plan';
+import { pickEffectiveSubscription } from '../../common/helpers/subscription-access';
 
 const getActivePlanTier = async (userId: string): Promise<PlanTier> => {
-  const activeSubscription = await Subscription.findOne({
+  const subscriptions = await Subscription.find({
     userId,
     status: { $in: ['active', 'trialing'] },
   })
+    .sort({ activationDate: -1, createdAt: -1 })
     .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
     .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier');
+
+  const activeSubscription = pickEffectiveSubscription(subscriptions as any[]);
 
   const effectivePlanDoc = ((activeSubscription?.cancelDate ? (activeSubscription as any)?.lockedPlanId : null) ?? (activeSubscription?.planId as any)) as any;
   return effectivePlanDoc?.tier ?? 'starter';
