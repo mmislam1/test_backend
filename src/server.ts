@@ -8,10 +8,20 @@ import { startAutoRenewReminderWorker } from './modules/billing/auto-renew-remin
 import { startPendingPlanChangeWorker } from './modules/billing/pending-plan-change.worker';
 import { startTrialReminderWorker } from './modules/billing/trial-reminder.worker';
 import { syncPlanCatalogFromEnv } from './modules/billing/plan-catalog.service';
+import { startXxBillingWorker } from './modules/xxbilling/xxbilling.worker';
 
 dns.setDefaultResultOrder("ipv4first");
 
-const BILLING_LOG_COLLECTIONS = new Set(['alerts', 'payments', 'plans', 'subscriptions', 'users']);
+const BILLING_LOG_COLLECTIONS = new Set([
+  'alerts',
+  'payments',
+  'plans',
+  'subscriptions',
+  'users',
+  'xxsubscriptions',
+  'xxpayments',
+  'xxbillinglogs',
+]);
 const REDACTED_LOG_KEYS = /password|token|secret|authorization|email|signature|rawbody/i;
 
 const sanitizeForLog = (value: unknown): unknown => {
@@ -62,6 +72,7 @@ const bootstrap = async () => {
       startAutoRenewReminderWorker();
       startPendingPlanChangeWorker();
       startTrialReminderWorker();
+      startXxBillingWorker();
     });
   } catch (err) {
     console.error("❌ Server startup error:", err);

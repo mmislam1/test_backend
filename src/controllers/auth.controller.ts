@@ -10,9 +10,9 @@ import { AppError } from '../common/errors/AppError';
 import { isEmailServiceConfigured, sendEmail } from '../common/helpers/email.client';
 import {
   completeReferralEvent,
-  grantLoginProAccess,
   grantFreeMonthPremium,
 } from '../modules/referral/referral.controller';
+import { ensureXxProTrialOnSignin } from '../modules/xxbilling/xxbilling.service';
 
 const signToken = (id: string) => {
   const options: SignOptions = {
@@ -223,6 +223,10 @@ export class AuthController {
       }
 
       await User.findByIdAndUpdate(user._id, { lastLoginAt: new Date() });
+      const xxBilling = await ensureXxProTrialOnSignin(String(user._id));
+      const refreshedUser = await User.findById(user._id)
+        .select('credits alertsRemaining subscriptionStatus')
+        .lean();
 
       const token = signToken(user._id as string);
       return res.status(StatusCodes.OK).json({
@@ -233,9 +237,12 @@ export class AuthController {
           name: user.name,
           email: user.email,
           role: user.role,
-          credits: user.credits,
+          credits: refreshedUser?.credits ?? user.credits,
+          alertsRemaining: refreshedUser?.alertsRemaining ?? user.alertsRemaining,
+          subscriptionStatus: refreshedUser?.subscriptionStatus ?? user.subscriptionStatus,
           referralCode: user.referralCode,
           referralCount: user.referralCount,
+          xxBilling: xxBilling.subscription,
         },
       });
     } catch (error) {
@@ -419,8 +426,6 @@ export class AuthController {
             );
             await completeReferralEvent(String(legacyUser._id));
             await grantFreeMonthPremium(String(legacyUser._id));
-          } else {
-            await grantLoginProAccess(String(legacyUser._id));
           }
 
           legacyUser.emailVerified = true;
@@ -480,8 +485,6 @@ export class AuthController {
         );
         await completeReferralEvent(String(newUser._id));
         await grantFreeMonthPremium(String(newUser._id));
-      } else {
-        await grantLoginProAccess(String(newUser._id));
       }
 
       await PendingRegistration.deleteOne({ _id: pending._id });

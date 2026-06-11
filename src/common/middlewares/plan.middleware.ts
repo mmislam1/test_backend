@@ -28,6 +28,10 @@ import { AppError } from '../errors/AppError';
 import { StatusCodes } from 'http-status-codes';
 import type { PlanTier } from '../../models/plan';
 import { evaluateSubscriptionAccess, pickEffectiveSubscription } from '../helpers/subscription-access';
+import {
+  getXxPlanForMiddleware,
+  getXxSubscriptionForMiddleware,
+} from '../../modules/xxbilling/xxbilling.service';
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -65,7 +69,7 @@ export const planMiddleware = async (
     }
 
     // Fetch user doc and most-recent subscription in parallel
-    const [user, sub] = await Promise.all([
+    const [user, sub, xxSub] = await Promise.all([
       User.findById(userId).select('isActive subscriptionStatus credits paddleSubscriptionId').lean(),
       Subscription.find({ userId })
         .sort({ activationDate: -1, createdAt: -1 })
@@ -73,6 +77,7 @@ export const planMiddleware = async (
         .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
         .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier')
         .lean(),
+      getXxSubscriptionForMiddleware(userId),
     ]);
 
     if (!user) {
@@ -107,6 +112,23 @@ export const planMiddleware = async (
     };
 
     // ── 1. Subscription document status + real-time period checks ───────
+    if (xxSub) {
+      const xxPlan = getXxPlanForMiddleware(xxSub.planTier as PlanTier);
+      const tier = xxPlan.tier as PlanTier;
+      const planDef = getPlanDefinition(tier);
+      await normalizeLegacyCredits(xxPlan.monitors);
+      await enforceMonthlyUploadLimit(xxPlan.monitors);
+      req.planDef = {
+        ...planDef,
+        imageUploadLimit: xxPlan.monitors,
+        alertLimit: xxPlan.alertLimit === null ? 0 : xxPlan.alertLimit,
+      };
+      req.planTier = tier;
+      req.accessVia = 'subscription';
+      req.subscriptionStatus = xxSub.status;
+      return next();
+    }
+
     const effectiveSub = pickEffectiveSubscription(sub as any[], {
       preferredSubscriptionId: (user as any)?.paddleSubscriptionId,
     });

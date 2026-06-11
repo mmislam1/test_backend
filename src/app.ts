@@ -13,11 +13,13 @@ import searchRoutes from './modules/image-serp/searchRoutes';
 import pdfRoutes from './modules/pdf/reports.routes';
 import userDetails from './modules/user-details/user-details.routes';
 import billingRoutes from './modules/billing/billing.routes';
+import xxBillingRoutes from './modules/xxbilling/xxbilling.routes';
 import referralRoutes from './modules/referral/referral.routes';
 import { adminRouter } from './modules/admin/admin.routes';
 import contactRoutes from './modules/contact/contact.routes';
 import rateLimit from 'express-rate-limit';
 import { handlePaddleWebhook } from "./modules/paddle/paddle.webhook";
+import { handleXxPaddleWebhook } from './modules/xxbilling/xxpaddle.webhook';
 import passport from './config/passport';
 
 const app = express();
@@ -40,10 +42,32 @@ app.post(
 	handlePaddleWebhook,
 );
 
+app.post(
+	'/api/v1/webhooks/xxpaddle',
+	express.raw({ type: 'application/json' }),
+	(req, _res, next) => {
+		const body = req.body;
+		(req as any).rawBody = Buffer.isBuffer(body)
+			? body.toString('utf8')
+			: typeof body === 'string'
+				? body
+				: '';
+		next();
+	},
+	handleXxPaddleWebhook,
+);
+
 app.get('/api/v1/webhooks/paddle', (_req, res) => {
 	res.status(405).json({
 		success: false,
 		message: 'Use POST for Paddle webhooks.',
+	});
+});
+
+app.get('/api/v1/webhooks/xxpaddle', (_req, res) => {
+	res.status(405).json({
+		success: false,
+		message: 'Use POST for XX Paddle webhooks.',
 	});
 });
 
@@ -117,6 +141,7 @@ app.use('/api/v1/pdf', pdfRoutes);
 app.use('/api/v1/user-details', userDetails);
 app.use('/api/v1/user', userDetails);
 app.use('/api/v1/billing', billingRoutes);
+app.use('/api/v1/xxbilling', xxBillingRoutes);
 app.use('/api/v1/referral', referralRoutes);
 app.use('/api/v1/admin', adminRouter);
 app.use('/api/v1/contact', contactRoutes);

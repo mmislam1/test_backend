@@ -5,6 +5,7 @@ import rateLimit from 'express-rate-limit';
 import { authMiddleware } from '../common/middlewares/auth.middleware';
 import { authController } from '../controllers/auth.controller';
 import type { IUser } from '../models/users';
+import { ensureXxProTrialOnSignin } from '../modules/xxbilling/xxbilling.service';
 
 const router = Router();
 
@@ -103,13 +104,19 @@ router.get(
 router.get(
   '/google/callback',
   passport.authenticate('google', { session: false, failureRedirect: `${process.env.FRONTEND_URL}/login?error=google_auth_failed` }),
-  (req, res) => {
-    const user = req.user as unknown as IUser;
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET as string, {
-      expiresIn: (process.env.JWT_EXPIRES_IN || '30d') as any,
-    });
-    const redirectUrl = `${process.env.FRONTEND_URL}/auth/google/success?token=${token}`;
-    res.redirect(redirectUrl);
+  async (req, res) => {
+    try {
+      const user = req.user as unknown as IUser;
+      await ensureXxProTrialOnSignin(String(user._id));
+      const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET as string, {
+        expiresIn: (process.env.JWT_EXPIRES_IN || '30d') as any,
+      });
+      const redirectUrl = `${process.env.FRONTEND_URL}/auth/google/success?token=${token}`;
+      res.redirect(redirectUrl);
+    } catch (error) {
+      console.error('[Auth] Google callback xx trial failed:', error);
+      res.redirect(`${process.env.FRONTEND_URL}/login?error=google_auth_failed`);
+    }
   },
 );
 
