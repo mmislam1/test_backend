@@ -12,12 +12,12 @@ import { yandexRouter } from './modules/yandex-search2/yandex.routes';
 import searchRoutes from './modules/image-serp/searchRoutes';
 import pdfRoutes from './modules/pdf/reports.routes';
 import userDetails from './modules/user-details/user-details.routes';
-import billingRoutes from './modules/billing/billing.routes';
+import billingRoutes from './modules/xxbilling/xxbilling.routes';
 import referralRoutes from './modules/referral/referral.routes';
 import { adminRouter } from './modules/admin/admin.routes';
 import contactRoutes from './modules/contact/contact.routes';
 import rateLimit from 'express-rate-limit';
-import { handlePaddleWebhook } from "./modules/paddle/paddle.webhook";
+import { handleXXPaddleWebhook } from "./modules/xxbilling/xxpaddle.webhook";
 import passport from './config/passport';
 
 const app = express();
@@ -37,7 +37,7 @@ app.post(
 				: '';
 		next();
 	},
-	handlePaddleWebhook,
+	handleXXPaddleWebhook,
 );
 
 app.get('/api/v1/webhooks/paddle', (_req, res) => {

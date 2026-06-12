@@ -4,26 +4,23 @@ import fs from 'fs';
 import { Search } from '../../models/searches';
 import { Result } from '../../models/results';
 import { User } from '../../models/users';
-import { Subscription } from '../../models/subscriptions';
+import { XXSubscription } from '../../models/xxsubscription';
 import { generateSearchPdf } from './reports.service';
 import { sendReportEmail } from './email.service'; // Your existing email logic
-import { getPlanDefinition } from '../billing/billing.constants';
-import type { PlanTier } from '../../models/plan';
-import { pickEffectiveSubscription } from '../../common/helpers/subscription-access';
+import { getPlanDefinition, type PlanTier } from '../xxbilling/xxbilling.constants';
+import { xxPickEffectiveSubscription } from '../xxbilling/xxbilling.service';
 
 const getActivePlanTier = async (userId: string): Promise<PlanTier> => {
-  const subscriptions = await Subscription.find({
+  const subscriptions = await XXSubscription.find({
     userId,
     status: { $in: ['active', 'trialing'] },
   })
     .sort({ activationDate: -1, createdAt: -1 })
-    .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
-    .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier');
+    .lean();
 
-  const activeSubscription = pickEffectiveSubscription(subscriptions as any[]);
+  const activeSubscription = xxPickEffectiveSubscription(subscriptions as any[]);
 
-  const effectivePlanDoc = ((activeSubscription?.cancelDate ? (activeSubscription as any)?.lockedPlanId : null) ?? (activeSubscription?.planId as any)) as any;
-  return effectivePlanDoc?.tier ?? 'starter';
+  return (activeSubscription as any)?.planTier ?? 'starter';
 };
 
 export const handlePdfGeneration = async (req: Request, res: Response): Promise<any> => {

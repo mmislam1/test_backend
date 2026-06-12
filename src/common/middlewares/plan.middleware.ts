@@ -20,14 +20,13 @@
  */
 
 import { Request, Response, NextFunction } from 'express';
-import { Subscription, type SubscriptionStatus } from '../../models/subscriptions';
+import { XXSubscription, type XXSubscriptionStatus } from '../../models/xxsubscription';
 import { User } from '../../models/users';
 import { Search } from '../../models/searches';
-import { getPlanDefinition, type PlanDefinition } from '../../modules/billing/billing.constants';
+import { getPlanDefinition, type PlanDefinition, type PlanTier } from '../../modules/xxbilling/xxbilling.constants';
 import { AppError } from '../errors/AppError';
 import { StatusCodes } from 'http-status-codes';
-import type { PlanTier } from '../../models/plan';
-import { evaluateSubscriptionAccess, pickEffectiveSubscription } from '../helpers/subscription-access';
+import { xxEvaluateSubscriptionAccess, xxPickEffectiveSubscription } from '../../modules/xxbilling/xxbilling.service';
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -36,7 +35,7 @@ import { evaluateSubscriptionAccess, pickEffectiveSubscription } from '../helper
  * 'past_due' is included so users in Paddle's grace period keep working;
  * controllers can inspect req.subscriptionStatus and show a payment-due warning.
  */
-const SUB_ACCESS_STATUSES: SubscriptionStatus[] = ['active', 'trialing', 'past_due'];
+const SUB_ACCESS_STATUSES: XXSubscriptionStatus[] = ['active', 'trialing', 'past_due'];
 
 // ─── Type augmentation ─────────────────────────────────────────────────────
 
@@ -46,7 +45,7 @@ declare global {
       planDef?: PlanDefinition;
       planTier?: PlanTier;
       accessVia?: 'subscription' | 'credits';
-      subscriptionStatus?: SubscriptionStatus | string;
+      subscriptionStatus?: XXSubscriptionStatus | string;
     }
   }
 }
@@ -67,11 +66,8 @@ export const planMiddleware = async (
     // Fetch user doc and most-recent subscription in parallel
     const [user, sub] = await Promise.all([
       User.findById(userId).select('isActive subscriptionStatus credits paddleSubscriptionId').lean(),
-      Subscription.find({ userId })
+      XXSubscription.find({ userId })
         .sort({ activationDate: -1, createdAt: -1 })
-        .sort({ createdAt: -1 })
-        .populate<{ planId: { tier: PlanTier } }>('planId', 'tier')
-        .populate<{ lockedPlanId: { tier: PlanTier } }>('lockedPlanId', 'tier')
         .lean(),
     ]);
 
@@ -107,19 +103,16 @@ export const planMiddleware = async (
     };
 
     // ── 1. Subscription document status + real-time period checks ───────
-    const effectiveSub = pickEffectiveSubscription(sub as any[], {
-      preferredSubscriptionId: (user as any)?.paddleSubscriptionId,
-    });
+    const effectiveSub = xxPickEffectiveSubscription(sub as any[], (user as any)?.paddleSubscriptionId);
 
     if (effectiveSub) {
-      const { effectiveStatus, hasAccess } = evaluateSubscriptionAccess(
+      const { effectiveStatus, hasAccess } = xxEvaluateSubscriptionAccess(
         effectiveSub as any,
         user.subscriptionStatus ?? null,
       );
 
       if (hasAccess && effectiveStatus && SUB_ACCESS_STATUSES.includes(effectiveStatus)) {
-        const effectivePlanDoc = ((effectiveSub.cancelDate ? (effectiveSub as any).lockedPlanId : null) ?? (effectiveSub.planId as any)) as any;
-        const tier: PlanTier = effectivePlanDoc?.tier ?? 'starter';
+        const tier: PlanTier = (effectiveSub as any)?.planTier ?? 'starter';
         const planDef = getPlanDefinition(tier);
         await normalizeLegacyCredits(planDef.imageUploadLimit);
         await enforceMonthlyUploadLimit(planDef.imageUploadLimit);

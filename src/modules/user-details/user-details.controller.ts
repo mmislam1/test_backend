@@ -5,32 +5,26 @@ import { Monitor } from '../../models/monitors';
 import { Alert } from '../../models/alerts';
 import { Folder } from '../../models/folders';
 import { User } from '../../models/users';
-import { Subscription } from '../../models/subscriptions';
+import { XXSubscription } from '../../models/xxsubscription';
 import bcrypt from 'bcryptjs';
 import { getSearchDetails } from './details.helper';
-import { getPlanDefinition } from '../billing/billing.constants';
-import type { PlanTier } from '../../models/plan';
+import { getPlanDefinition, type PlanTier } from '../xxbilling/xxbilling.constants';
 import { normalizeStoredResultDetails } from '../../common/helpers/result-normalizer';
 import { sendAdminResultStatusChangeEmail } from '../notifications/notification-email.service';
-import { pickEffectiveSubscription } from '../../common/helpers/subscription-access';
+import { xxPickEffectiveSubscription } from '../xxbilling/xxbilling.service';
 
 const REVIEWED_STATUSES = ['takedown_request', 'report_infringement', 'dispute', 'legal_support_request'];
 const SETTINGS_USER_FIELDS =
   'name email affiliation jobTitle country phoneNumber role joiningDate notificationSettings';
 
 const getActivePlanTier = async (userId: string): Promise<PlanTier> => {
-  const subscriptions = await Subscription.find({ userId, status: { $in: ['active', 'trialing', 'past_due'] } })
+  const subscriptions = await XXSubscription.find({ userId, status: { $in: ['active', 'trialing', 'past_due'] } })
     .sort({ activationDate: -1, createdAt: -1 })
-    .populate<{
-      planId: { tier: PlanTier };
-      lockedPlanId: { tier: PlanTier };
-    }>('planId', 'tier')
-    .populate('lockedPlanId', 'tier');
+    .lean();
 
-  const activeSubscription = pickEffectiveSubscription(subscriptions as any[]);
+  const activeSubscription = xxPickEffectiveSubscription(subscriptions as any[]);
 
-  const effectivePlanDoc = ((activeSubscription?.cancelDate ? (activeSubscription as any)?.lockedPlanId : null) ?? (activeSubscription?.planId as any)) as any;
-  return effectivePlanDoc?.tier ?? 'starter';
+  return (activeSubscription as any)?.planTier ?? 'starter';
 };
 
 const normalizeDateRange = (dateInput?: string) => {

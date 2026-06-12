@@ -3,15 +3,15 @@ import { config } from "./config/env";
 import app from "./app";
 import dns from "dns";
 import { startWeeklyRescanWorker } from './modules/notifications/weekly-rescan.worker';
-import { startTrialExpiryWorker } from './modules/billing/trial-expiry.worker';
-import { startAutoRenewReminderWorker } from './modules/billing/auto-renew-reminder.worker';
-import { startPendingPlanChangeWorker } from './modules/billing/pending-plan-change.worker';
-import { startTrialReminderWorker } from './modules/billing/trial-reminder.worker';
-import { syncPlanCatalogFromEnv } from './modules/billing/plan-catalog.service';
+import { startXXTrialExpiryWorker } from './modules/xxbilling/xxtrial-expiry.worker';
+import { startXXAutoRenewReminderWorker } from './modules/xxbilling/xxauto-renew-reminder.worker';
+import { startXXPendingPlanChangeWorker } from './modules/xxbilling/xxpending-plan-change.worker';
+import { startXXTrialReminderWorker } from './modules/xxbilling/xxtrial-reminder.worker';
+import { xxSyncPlanCatalogFromEnv } from './modules/xxbilling/xxbilling.service';
 
 dns.setDefaultResultOrder("ipv4first");
 
-const BILLING_LOG_COLLECTIONS = new Set(['alerts', 'payments', 'plans', 'subscriptions', 'users']);
+const BILLING_LOG_COLLECTIONS = new Set(['alerts', 'xxpayments', 'xxplans', 'xxsubscriptions', 'xxbillinglogs', 'users']);
 const REDACTED_LOG_KEYS = /password|token|secret|authorization|email|signature|rawbody/i;
 
 const sanitizeForLog = (value: unknown): unknown => {
@@ -53,15 +53,15 @@ const bootstrap = async () => {
     await mongoose.connect(process.env.MONGO_URI || "");
     console.log("🌿 MongoDB Connected");
 
-    await syncPlanCatalogFromEnv();
+    await xxSyncPlanCatalogFromEnv();
 
     app.listen(config.port, () => {
       console.log(`🚀 Server running on http://localhost:${config.port}`);
       startWeeklyRescanWorker();
-      startTrialExpiryWorker();
-      startAutoRenewReminderWorker();
-      startPendingPlanChangeWorker();
-      startTrialReminderWorker();
+      startXXTrialExpiryWorker();
+      startXXAutoRenewReminderWorker();
+      startXXPendingPlanChangeWorker();
+      startXXTrialReminderWorker();
     });
   } catch (err) {
     console.error("❌ Server startup error:", err);

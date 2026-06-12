@@ -1,12 +1,12 @@
 import { createUserAlert } from '../../common/helpers/alert.helper';
 import { Result } from '../../models/results';
 import { Search } from '../../models/searches';
-import { Subscription } from '../../models/subscriptions';
+import { XXSubscription } from '../../models/xxsubscription';
 import { User } from '../../models/users';
 import { executeReverseImageSearch } from '../image-serp/serpApiService';
 import { sendWeeklyRescanNotificationEmail } from './notification-email.service';
 import { normalizeSerpMatchForResult } from '../../common/helpers/result-normalizer';
-import { evaluateSubscriptionAccess } from '../../common/helpers/subscription-access';
+import { xxEvaluateSubscriptionAccess } from '../xxbilling/xxbilling.service';
 
 const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const WORKER_INTERVAL_MS = 10 * 60 * 1000;
@@ -32,7 +32,7 @@ const buildSignature = (entry: {
 };
 
 const hasSubscriptionAccess = async (userId: string, userSubscriptionStatus?: string | null) => {
-  const latestSub = await Subscription.findOne({ userId })
+  const latestSub = await XXSubscription.findOne({ userId })
     .sort({ createdAt: -1 })
     .select('status grantSource currentPeriodEnd paddleSubscriptionId')
     .lean();
@@ -41,7 +41,7 @@ const hasSubscriptionAccess = async (userId: string, userSubscriptionStatus?: st
     return userSubscriptionStatus === 'active' || userSubscriptionStatus === 'trialing';
   }
 
-  const { hasAccess } = evaluateSubscriptionAccess(latestSub as any, userSubscriptionStatus ?? null);
+  const { hasAccess } = xxEvaluateSubscriptionAccess(latestSub as any, userSubscriptionStatus ?? null);
   return hasAccess;
 };
 

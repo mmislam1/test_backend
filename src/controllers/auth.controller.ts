@@ -10,9 +10,11 @@ import { AppError } from '../common/errors/AppError';
 import { isEmailServiceConfigured, sendEmail } from '../common/helpers/email.client';
 import {
   completeReferralEvent,
-  grantLoginProAccess,
-  grantFreeMonthPremium,
 } from '../modules/referral/referral.controller';
+import {
+  xxGrantLoginProAccess,
+  xxGrantFreeMonthPremium,
+} from '../modules/xxbilling/xxbilling.service';
 
 const signToken = (id: string) => {
   const options: SignOptions = {
@@ -222,6 +224,7 @@ export class AuthController {
         );
       }
 
+      await xxGrantLoginProAccess(String(user._id));
       await User.findByIdAndUpdate(user._id, { lastLoginAt: new Date() });
 
       const token = signToken(user._id as string);
@@ -418,9 +421,9 @@ export class AuthController {
               { upsert: true },
             );
             await completeReferralEvent(String(legacyUser._id));
-            await grantFreeMonthPremium(String(legacyUser._id));
+            await xxGrantFreeMonthPremium(String(legacyUser._id));
           } else {
-            await grantLoginProAccess(String(legacyUser._id));
+            await xxGrantLoginProAccess(String(legacyUser._id));
           }
 
           legacyUser.emailVerified = true;
@@ -479,9 +482,9 @@ export class AuthController {
           { upsert: true },
         );
         await completeReferralEvent(String(newUser._id));
-        await grantFreeMonthPremium(String(newUser._id));
+        await xxGrantFreeMonthPremium(String(newUser._id));
       } else {
-        await grantLoginProAccess(String(newUser._id));
+        await xxGrantLoginProAccess(String(newUser._id));
       }
 
       await PendingRegistration.deleteOne({ _id: pending._id });

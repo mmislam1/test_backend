@@ -1,12 +1,12 @@
 import { Request, Response } from 'express';
 import { User } from '../../models/users';
 import { ReferralEvent } from '../../models/referral-event';
-import { Subscription } from '../../models/subscriptions';
-import { Plan } from '../../models/plan';
 import { Reward } from '../../models/rewards';
-import { getPlanDefinition } from '../billing/billing.constants';
-import type { PlanTier } from '../../models/plan';
-import { topUpCredits, topUpAlerts } from '../../common/helpers/alert.helper';
+import {
+  xxExtendOrGrantProReward,
+  xxGrantFreeMonthPremium,
+  xxGrantLoginProAccess,
+} from '../xxbilling/xxbilling.service';
 
 const DEFAULT_MILESTONE_COUNT = 5;
 const PDF_REWARD_SLUG = 'pdf-generator';
@@ -118,127 +118,13 @@ export const completeReferralEvent = async (newUserId: string): Promise<void> =>
     if (!unlocked) return;
 
     // Grant +23 days Pro subscription to the referrer (additive)
-    await extendOrGrantProSubscription(
-      String(referrer._id),
-      23,
-      'referral',
-      '[referral] Failed to grant +23-day Pro reward',
-    );
-  }
-};
-
-const grantPlanForDays = async (
-  userId: string,
-  tier: PlanTier,
-  days: number,
-  grantSource: 'trial' | 'referral',
-  logPrefix: string,
-): Promise<void> => {
-  try {
-    const planDef = getPlanDefinition(tier);
-
-    const plan = await Plan.findOneAndUpdate(
-      { tier },
-      {
-        $set: {
-          name:              planDef.name,
-          imageUploadLimit:  planDef.imageUploadLimit,
-          alertLimit:        planDef.alertLimit,
-          pdfEnabled:        planDef.pdfEnabled,
-          weeklyEmailAlerts: planDef.weeklyEmailAlerts,
-          monthlyPrice:      planDef.pricing.monthly,
-          annualPrice:       planDef.pricing.annual,
-          trialDays:         planDef.trialDays,
-        },
-        $setOnInsert: { tier },
-      },
-      { upsert: true, new: true },
-    );
-
-    // Cancel any existing active/pending subs
-    await Subscription.updateMany(
-      { userId, status: { $in: ['active', 'pending'] } },
-      { $set: { status: 'cancelled', cancelDate: new Date() } },
-    );
-
-    const now = new Date();
-    const periodEnd = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
-
-    await Subscription.create({
-      userId,
-      planId:           plan._id,
-      billingCycle:     'monthly',
-      grantSource,
-      activationDate:   now,
-      currentPeriodEnd: periodEnd,
-      nextBillingDate:  periodEnd,
-      status:           grantSource === 'trial' ? 'trialing' : 'active',
-      ...(grantSource === 'trial' ? { trialReminderStages: [] } : {}),
-      ...(grantSource === 'trial' ? { trialEndDate: periodEnd } : {}),
-    });
-
-    // Top up the user's monitoring credits and alert quota
-    await Promise.all([
-      topUpCredits(userId, planDef.imageUploadLimit),
-      topUpAlerts(userId, planDef.alertLimit),
-    ]);
-  } catch (error) {
-    console.error(logPrefix, error);
-    throw error;
-  }
-};
-
-/**
- * Extends the user's current active/trialing subscription by `days`.
- * If no active subscription exists, creates a fresh Pro subscription for `days`.
- */
-const extendOrGrantProSubscription = async (
-  userId: string,
-  days: number,
-  grantSource: 'trial' | 'referral',
-  logPrefix: string,
-): Promise<void> => {
-  try {
-    const existing = await Subscription.findOne({
-      userId,
-      status: { $in: ['active', 'trialing'] },
-    }).sort({ createdAt: -1 });
-
-    const bonusMs = days * 24 * 60 * 60 * 1000;
-
-    if (existing) {
-      const base   = existing.currentPeriodEnd ?? new Date();
-      const newEnd = new Date(base.getTime() + bonusMs);
-      await Subscription.findByIdAndUpdate(existing._id, {
-        currentPeriodEnd: newEnd,
-        nextBillingDate:  newEnd,
-        ...(grantSource === 'trial' ? { trialReminderStages: [] } : {}),
-      });
-    } else {
-      await grantPlanForDays(userId, 'pro', days, grantSource, logPrefix);
-    }
-
-    // Top up quota for the bonus days (use Pro plan limits)
-    const proDef = getPlanDefinition('pro');
-    await Promise.all([
-      topUpCredits(userId, proDef.imageUploadLimit),
-      topUpAlerts(userId, proDef.alertLimit),
-    ]);
-  } catch (error) {
-    console.error(logPrefix, error);
-    throw error;
+    await xxExtendOrGrantProReward(String(referrer._id), 23);
   }
 };
 
 // ─── Internal helper — called from auth.controller on all registrations ─────
 export const grantLoginProAccess = async (newUserId: string): Promise<void> => {
-  await grantPlanForDays(
-    newUserId,
-    'pro',
-    7,
-    'trial',
-    '[login] Failed to grant 7-day Pro access',
-  );
+  await xxGrantLoginProAccess(newUserId);
 };
 
 // ─── Internal helper — called from auth.controller on referral verifications ─
@@ -247,11 +133,5 @@ export const grantLoginProAccess = async (newUserId: string): Promise<void> => {
  * referred user.  This replaces any current trial/subscription window.
  */
 export const grantFreeMonthPremium = async (newUserId: string): Promise<void> => {
-  await grantPlanForDays(
-    newUserId,
-    'premium',
-    30,
-    'referral',
-    '[referral] Failed to grant free premium month',
-  );
+  await xxGrantFreeMonthPremium(newUserId);
 };

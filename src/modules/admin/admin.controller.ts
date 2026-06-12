@@ -3,10 +3,10 @@ import mongoose from 'mongoose';
 import { User } from '../../models/users';
 import { Search } from '../../models/searches';
 import { Result } from '../../models/results';
-import { Subscription } from '../../models/subscriptions';
-import { Payment } from '../../models/payment';
-import { Plan } from '../../models/plan';
+import { XXSubscription } from '../../models/xxsubscription';
+import { XXPayment } from '../../models/xxpayment';
 import axios from 'axios';
+import { getXXPlanDefinition } from '../xxbilling/xxbilling.constants';
 import {
   AnalyticsDateRangePreset,
   DashboardStats,
@@ -40,6 +40,19 @@ const getTrialDaysLeft = (trialEndDate?: Date | null): number | undefined => {
   return Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
 };
 
+const toAdminSubscription = (subscription: any) => {
+  if (!subscription) return undefined;
+  const tier = subscription.planTier || 'starter';
+  const plan = getXXPlanDefinition(tier);
+  return {
+    ...subscription,
+    planId: { name: plan.name, tier },
+    tier,
+    planName: plan.name,
+    trialDaysLeft: getTrialDaysLeft(subscription.trialEndDate),
+  };
+};
+
 /**
  * GET /api/v1/admin/dashboard
  * Returns comprehensive dashboard statistics
@@ -71,9 +84,9 @@ export const getDashboard = async (
       Search.countDocuments({ status: 'processing' }),
       Search.countDocuments({ status: 'completed' }),
       User.countDocuments({ role: 'general' }),
-      Subscription.countDocuments({ status: 'active' }),
+      XXSubscription.countDocuments({ status: 'active' }),
       Search.countDocuments({ date: { $gte: today } }),
-      Payment.aggregate([
+      XXPayment.aggregate([
         { $match: { createdAt: { $gte: monthStart }, status: 'completed' } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
@@ -81,7 +94,7 @@ export const getDashboard = async (
         .sort({ date: -1 })
         .limit(5)
         .populate('userId', 'name email'),
-      Subscription.find({ createdAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) } })
+      XXSubscription.find({ createdAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) } })
         .sort({ createdAt: -1 })
         .limit(5)
         .populate('userId', 'name email'),
@@ -89,7 +102,7 @@ export const getDashboard = async (
         .sort({ createdAt: -1 })
         .limit(5)
         .select('name email joiningDate'),
-      Payment.find({ createdAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) } })
+      XXPayment.find({ createdAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) } })
         .sort({ createdAt: -1 })
         .limit(5)
         .populate('userId', 'name email'),
@@ -192,14 +205,6 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
     const [users, total] = await Promise.all([
       User.find(filter)
         .select('name email isActive isApproved joiningDate subscriptionId')
-        .populate({
-          path: 'subscriptionId',
-          select: 'status grantSource billingCycle trialEndDate planId',
-          populate: {
-            path: 'planId',
-            select: 'name tier',
-          },
-        })
         .skip(skip)
         .limit(limit)
         .sort({ createdAt: -1 }),
@@ -217,14 +222,9 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
       searchCounts.map((sc: any) => [sc._id.toString(), sc.count]),
     );
 
-    const usersWithoutLinkedSubscription = users
-      .filter((u: any) => !u.subscriptionId)
-      .map((u: any) => u._id);
-
-    const fallbackSubscriptions = usersWithoutLinkedSubscription.length
-      ? await Subscription.find({ userId: { $in: usersWithoutLinkedSubscription } })
+    const fallbackSubscriptions = userIds.length
+      ? await XXSubscription.find({ userId: { $in: userIds } })
           .sort({ activationDate: -1, createdAt: -1 })
-          .populate('planId', 'name tier')
       : [];
 
     const fallbackSubscriptionMap = new Map<string, any>();
@@ -236,7 +236,7 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
     });
 
     const userList: UserListItem[] = users.map((user: any) => {
-      const resolvedSubscription = user.subscriptionId || fallbackSubscriptionMap.get(user._id.toString());
+      const resolvedSubscription = toAdminSubscription(fallbackSubscriptionMap.get(user._id.toString()));
 
       return {
       _id: user._id,
@@ -245,8 +245,8 @@ export const getUsers = async (req: Request, res: Response): Promise<void> => {
       status: user.isActive ? 'active' : 'inactive',
       subscription: resolvedSubscription
         ? {
-            tier: (resolvedSubscription.planId as any)?.tier || 'starter',
-            planName: (resolvedSubscription.planId as any)?.name || '',
+            tier: (resolvedSubscription as any)?.tier || 'starter',
+            planName: (resolvedSubscription as any)?.planName || '',
             status: (resolvedSubscription as any).status || 'pending',
             grantSource: (resolvedSubscription as any).grantSource || '',
             billingCycle: (resolvedSubscription as any).billingCycle || '',
@@ -285,13 +285,6 @@ export const getUserDetails = async (req: Request, res: Response): Promise<void>
     const { userId } = req.params;
 
     const user = await User.findById(userId)
-      .populate({
-        path: 'subscriptionId',
-        populate: {
-          path: 'planId',
-          select: 'name tier',
-        },
-      })
       .select(
         'name email phoneNumber affiliation jobTitle country joiningDate role isActive isApproved credits monitors subscriptionId subscriptionStatus referralCode referralCount',
       );
@@ -309,27 +302,25 @@ export const getUserDetails = async (req: Request, res: Response): Promise<void>
 
     const searchCount = await Search.countDocuments({ userId });
 
-    let effectiveSubscription: any = user.subscriptionId;
-    let effectiveSubscriptionId: any = user.subscriptionId?._id;
+    let effectiveSubscription: any = null;
+    let effectiveSubscriptionId: any = null;
 
     if (!effectiveSubscription) {
-      const latestSubscription = await Subscription.findOne({ userId })
-        .sort({ activationDate: -1, createdAt: -1 })
-        .populate('planId', 'name tier');
+      const latestSubscription = await XXSubscription.findOne({ userId })
+        .sort({ activationDate: -1, createdAt: -1 });
 
       if (latestSubscription) {
-        effectiveSubscription = latestSubscription;
+        effectiveSubscription = toAdminSubscription(latestSubscription.toObject());
         effectiveSubscriptionId = latestSubscription._id;
       }
     }
 
     if (!effectiveSubscription && user.subscriptionStatus === 'trialing') {
-      const trialSubscription = await Subscription.findOne({ userId, status: 'trialing' })
-        .sort({ activationDate: -1, createdAt: -1 })
-        .populate('planId', 'name tier');
+      const trialSubscription = await XXSubscription.findOne({ userId, status: 'trialing' })
+        .sort({ activationDate: -1, createdAt: -1 });
 
       if (trialSubscription) {
-        effectiveSubscription = trialSubscription;
+        effectiveSubscription = toAdminSubscription(trialSubscription.toObject());
         (effectiveSubscription as any).trialDaysLeft = getTrialDaysLeft((trialSubscription as any).trialEndDate);
         effectiveSubscriptionId = trialSubscription._id;
       } else {

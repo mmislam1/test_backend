@@ -1,8 +1,8 @@
 import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { User } from '../models/users';
-import { Subscription } from '../models/subscriptions';
-import { grantLoginProAccess } from '../modules/referral/referral.controller';
+import { XXSubscription } from '../models/xxsubscription';
+import { xxGrantLoginProAccess } from '../modules/xxbilling/xxbilling.service';
 
 const shouldHydrateNameFromGoogle = (currentName: string | undefined, email: string): boolean => {
   const normalized = String(currentName || '').trim().toLowerCase();
@@ -29,10 +29,10 @@ const shouldHydrateNameFromGoogle = (currentName: string | undefined, email: str
 };
 
 const ensureInitialTrialAccess = async (userId: string) => {
-  const hasAnySubscription = await Subscription.findOne({ userId }).lean();
+  const hasAnySubscription = await XXSubscription.findOne({ userId }).lean();
 
   if (!hasAnySubscription) {
-    await grantLoginProAccess(userId);
+    await xxGrantLoginProAccess(userId);
   }
 };
 
