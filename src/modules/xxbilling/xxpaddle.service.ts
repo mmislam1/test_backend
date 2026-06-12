@@ -6,6 +6,7 @@ import type { XXBillingCycle, XXPlanTier } from '../../models/xxplan';
 import { getXXPlanDefinition, getXXPriceId } from './xxbilling.constants';
 import {
   xxApplyEntitlementsForSubscription,
+  xxGetActiveLocalGrantForUser,
   xxIsPaddlePriceId,
   xxMapStatusToUserStatus,
   xxNotifyUser,
@@ -197,7 +198,34 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
       : undefined);
 
   const existing = await XXSubscription.findOne({ paddleSubscriptionId: data.id });
-  const status = incomingStatus;
+  const existingActivationDate = existing?.activationDate ? new Date(existing.activationDate) : undefined;
+  const shouldRemainPending =
+    existing?.status === 'pending' &&
+    !!existingActivationDate &&
+    existingActivationDate.getTime() > Date.now() &&
+    ['active', 'trialing', 'past_due'].includes(incomingStatus);
+
+  const activeLocalGrant = !existing && ['active', 'trialing', 'past_due'].includes(incomingStatus)
+    ? await xxGetActiveLocalGrantForUser(userId)
+    : null;
+  const shouldDeferForLocalGrant = !!activeLocalGrant?.currentPeriodEnd;
+  const deferredActivationDate = shouldRemainPending
+    ? existingActivationDate
+    : shouldDeferForLocalGrant
+      ? activeLocalGrant.currentPeriodEnd
+      : undefined;
+  const shouldKeepPendingCancellation =
+    existing?.status === 'cancelled' &&
+    existing?.grantSource === 'paid' &&
+    !!existing.cancelDate &&
+    !!scheduledCancel &&
+    !!existingActivationDate &&
+    existingActivationDate.getTime() > Date.now();
+  const status = shouldKeepPendingCancellation
+    ? 'cancelled'
+    : shouldRemainPending || shouldDeferForLocalGrant
+      ? 'pending'
+      : incomingStatus;
   const shouldUseScheduledChange =
     !!existing?.nextPlanTier &&
     !!existing?.nextBillingCycle &&
@@ -212,9 +240,9 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
         userId,
         planTier: shouldUseScheduledChange ? existing.planTier : tier,
         billingCycle: shouldUseScheduledChange ? existing.billingCycle : billingCycle,
-        grantSource: status === 'trialing' ? 'trial' : 'paid',
+        grantSource: 'paid',
         status,
-        activationDate: existing?.activationDate ?? (data.created_at ? new Date(data.created_at) : new Date()),
+        activationDate: deferredActivationDate ?? existing?.activationDate ?? (data.created_at ? new Date(data.created_at) : new Date()),
         paddleSubscriptionId: data.id,
         paddleCustomerId: data.customer_id,
         paddlePriceId: String(priceId),
@@ -222,6 +250,16 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
         ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
         ...(trialEnd ? { trialEndDate: trialEnd } : {}),
         ...(cancelDate ? { cancelDate } : {}),
+        metadata: {
+          ...(existing?.metadata ?? {}),
+          ...(status === 'pending'
+            ? {
+                pendingPaddleStatus: incomingStatus,
+                pendingReason: 'local_grant_active',
+                pendingUntil: deferredActivationDate,
+              }
+            : {}),
+        },
         ...(!cancelDate ? { autoRenewReminderStages: [] } : {}),
         ...(!trialEnd ? { trialReminderStages: [] } : {}),
       },
@@ -234,14 +272,25 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 
+  const cancelOtherSubscriptionsFilter: Record<string, any> = {
+    userId,
+    _id: { $ne: sub._id },
+    status: { $in: ['active', 'trialing', 'past_due'] },
+  };
+  const preservesLocalGrant = status === 'pending' || shouldKeepPendingCancellation;
+  if (preservesLocalGrant) {
+    cancelOtherSubscriptionsFilter.paddleSubscriptionId = { $exists: true, $ne: null };
+  }
+
   await Promise.all([
-    syncUserSubscriptionPointer(sub),
+    preservesLocalGrant
+      ? User.findByIdAndUpdate(userId, {
+          paddleCustomerId: sub.paddleCustomerId,
+          paddleSubscriptionId: sub.paddleSubscriptionId,
+        })
+      : syncUserSubscriptionPointer(sub),
     XXSubscription.updateMany(
-      {
-        userId,
-        _id: { $ne: sub._id },
-        status: { $in: ['active', 'trialing', 'past_due'] },
-      },
+      cancelOtherSubscriptionsFilter,
       { $set: { status: 'cancelled', cancelDate: new Date(), autoRenewEnabled: false } },
     ),
   ]);
@@ -256,7 +305,7 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
     source: 'paddle',
     message: `Paddle subscription synced as ${status} on ${sub.planTier} (${sub.billingCycle}).`,
     paddleSubscriptionId: data.id,
-    metadata: { tier, billingCycle, periodEnd, scheduledCancel: cancelDate },
+    metadata: { tier, billingCycle, periodEnd, scheduledCancel: cancelDate, deferredActivationDate },
   });
 
   return sub;

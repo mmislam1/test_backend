@@ -36,6 +36,9 @@ const asDate = (value?: Date | string | null): Date | null => {
 
 const asTimestamp = (value?: Date | string | null): number => asDate(value)?.getTime() ?? 0;
 
+const isPendingPaddleStatus = (value: unknown): value is XXSubscriptionStatus =>
+  value === 'active' || value === 'trialing' || value === 'past_due' || value === 'paused';
+
 export const xxIsPaddlePriceId = (value: string) => /^pri_[a-z\d]{26}$/i.test(value.trim());
 
 export const xxAddDays = (date: Date, days: number): Date =>
@@ -169,6 +172,25 @@ export const xxGetEffectiveSubscriptionForUser = async (
 
   return xxPickEffectiveSubscription(subscriptions as any[], (user as any)?.paddleSubscriptionId ?? null);
 };
+
+export const xxGetActiveLocalGrantForUser = async (userId: string, now = new Date()) =>
+  XXSubscription.findOne({
+    userId,
+    status: { $in: ['active', 'trialing'] },
+    grantSource: { $in: ['trial', 'referral'] },
+    paddleSubscriptionId: { $exists: false },
+    currentPeriodEnd: { $gt: now },
+  })
+    .sort({ currentPeriodEnd: -1, activationDate: -1, createdAt: -1 });
+
+export const xxGetPendingPaidSubscriptionForUser = async (userId: string) =>
+  XXSubscription.findOne({
+    userId,
+    status: 'pending',
+    grantSource: 'paid',
+    paddleSubscriptionId: { $exists: true, $ne: null },
+  })
+    .sort({ activationDate: 1, createdAt: -1 });
 
 export const xxGrantEntitlements = async (
   userId: string,
@@ -363,6 +385,71 @@ export const xxMapStatusToUserStatus = (
   if (status === 'cancelled' || status === 'expired') return 'canceled';
   if (status === 'active' || status === 'trialing' || status === 'past_due' || status === 'paused') return status;
   return undefined;
+};
+
+export const xxActivateDuePendingPaidSubscriptions = async (userIds?: string[]) => {
+  const now = new Date();
+  const query: Record<string, any> = {
+    status: 'pending',
+    grantSource: 'paid',
+    paddleSubscriptionId: { $exists: true, $ne: null },
+    activationDate: { $lte: now },
+  };
+
+  if (userIds?.length) {
+    query.userId = { $in: userIds };
+  }
+
+  const pendingSubscriptions = await XXSubscription.find(query);
+  for (const sub of pendingSubscriptions) {
+    const pendingStatus = sub.metadata?.pendingPaddleStatus;
+    const nextStatus = isPendingPaddleStatus(pendingStatus) ? pendingStatus : 'active';
+
+    sub.status = nextStatus;
+    sub.grantSource = 'paid';
+    sub.autoRenewEnabled = !sub.cancelDate && nextStatus !== 'paused';
+    sub.metadata = {
+      ...(sub.metadata ?? {}),
+      activatedFromPendingAt: now,
+    };
+    await sub.save();
+
+    const userStatus = xxMapStatusToUserStatus(sub.status);
+    await Promise.all([
+      User.findByIdAndUpdate(String(sub.userId), {
+        subscriptionId: sub._id,
+        paddleCustomerId: sub.paddleCustomerId,
+        paddleSubscriptionId: sub.paddleSubscriptionId,
+        ...(userStatus ? { subscriptionStatus: userStatus } : {}),
+      }),
+      XXSubscription.updateMany(
+        {
+          userId: sub.userId,
+          _id: { $ne: sub._id },
+          status: { $in: ['active', 'trialing', 'past_due'] },
+        },
+        { $set: { status: 'cancelled', cancelDate: now, autoRenewEnabled: false } },
+      ),
+    ]);
+
+    await xxApplyEntitlementsForSubscription(sub, 'pending paid subscription activation');
+    await Promise.all([
+      xxNotifyUser(
+        String(sub.userId),
+        `Your ${getXXPlanDefinition(sub.planTier).name} (${sub.billingCycle}) subscription is now active.`,
+        { paddleSubscriptionId: sub.paddleSubscriptionId },
+      ),
+      xxLogBilling({
+        userId: String(sub.userId),
+        event: 'pending_paid_subscription_activated',
+        source: 'worker',
+        message: `Activated pending paid ${sub.planTier} (${sub.billingCycle}) subscription.`,
+        paddleSubscriptionId: sub.paddleSubscriptionId,
+      }),
+    ]);
+  }
+
+  return pendingSubscriptions.length;
 };
 
 export const xxNotifyUser = async (

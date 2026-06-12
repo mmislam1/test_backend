@@ -1,6 +1,6 @@
 import { User } from '../../models/users';
 import { XXSubscription } from '../../models/xxsubscription';
-import { xxNotifyUser } from './xxbilling.service';
+import { xxActivateDuePendingPaidSubscriptions, xxNotifyUser } from './xxbilling.service';
 import { xxLogBilling } from './xxbilling.logger';
 
 const WORKER_INTERVAL_MS = parseInt(process.env.TRIAL_EXPIRY_INTERVAL_MS ?? '', 10) || 60 * 60 * 1000;
@@ -19,17 +19,34 @@ async function xxExpireTrials(): Promise<void> {
   const ids = expired.map((sub) => sub._id);
   const userIds = expired.map((sub) => String(sub.userId));
 
+  await XXSubscription.updateMany(
+    { _id: { $in: ids } },
+    { $set: { status: 'expired', autoRenewEnabled: false } },
+  );
+
+  await xxActivateDuePendingPaidSubscriptions(userIds);
+
+  const coveredUserIds = new Set(
+    (await XXSubscription.distinct('userId', {
+      userId: { $in: userIds },
+      status: { $in: ['active', 'trialing', 'past_due', 'pending'] },
+      paddleSubscriptionId: { $exists: true, $ne: null },
+    })).map((id) => String(id)),
+  );
+  const uncoveredUserIds = userIds.filter((userId) => !coveredUserIds.has(userId));
+
   await Promise.all([
-    XXSubscription.updateMany({ _id: { $in: ids } }, { $set: { status: 'expired', autoRenewEnabled: false } }),
-    User.updateMany({ _id: { $in: userIds } }, { $set: { subscriptionId: null, subscriptionStatus: 'canceled' } }),
-    ...userIds.map((userId) =>
+    uncoveredUserIds.length
+      ? User.updateMany({ _id: { $in: uncoveredUserIds } }, { $set: { subscriptionId: null, subscriptionStatus: 'canceled' } })
+      : Promise.resolve(),
+    ...uncoveredUserIds.map((userId) =>
       xxNotifyUser(userId, 'Your free access period has ended. Subscribe to continue using the service.'),
     ),
     xxLogBilling({
       event: 'local_grants_expired',
       source: 'worker',
       message: `Expired ${expired.length} local xx billing grant(s).`,
-      metadata: { count: expired.length },
+      metadata: { count: expired.length, activatedPendingPaid: coveredUserIds.size },
     }),
   ]);
 }

@@ -62,7 +62,7 @@ const UserSchema = new Schema<IUser>(
     joiningDate:   { type: Date, default: Date.now },
     role:          { type: String, enum: ['admin', 'general'], default: 'general' },
     isApproved:    { type: Boolean, default: true },
-    subscriptionId:{ type: Schema.Types.ObjectId, ref: 'Subscription' },
+    subscriptionId:{ type: Schema.Types.ObjectId, ref: 'XXSubscription' },
     credits:       { type: Number, default: 0 },
     alertsRemaining: { type: Number, default: 0 },
     monitors:      { type: Number, default: 0 },

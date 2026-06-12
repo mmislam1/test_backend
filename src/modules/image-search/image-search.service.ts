@@ -1,7 +1,7 @@
 import { visionClient } from "../../config/google-vision";
 import { AppError } from "../../common/errors/AppError";
 import { StatusCodes } from "http-status-codes";
-import type { PlanTier } from "../../models/plan";
+import type { XXPlanTier as PlanTier } from "../../models/xxplan";
 
 export class ImageSearchService {
   async detectExactMatches(imageBuffer: Buffer, planTier: PlanTier): Promise<any> {

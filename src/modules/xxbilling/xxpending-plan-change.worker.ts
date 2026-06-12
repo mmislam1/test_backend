@@ -1,6 +1,10 @@
 import { XXSubscription } from '../../models/xxsubscription';
 import { xxPatchPaddleSubscriptionPlan } from './xxpaddle.service';
-import { xxApplyEntitlementsForSubscription, xxNotifyUser } from './xxbilling.service';
+import {
+  xxActivateDuePendingPaidSubscriptions,
+  xxApplyEntitlementsForSubscription,
+  xxNotifyUser,
+} from './xxbilling.service';
 import { getXXPlanDefinition } from './xxbilling.constants';
 import { xxLogBilling } from './xxbilling.logger';
 
@@ -8,6 +12,8 @@ const WORKER_INTERVAL_MS = parseInt(process.env.PENDING_PLAN_CHANGE_SYNC_INTERVA
 const APPLY_LOOKAHEAD_MS = parseInt(process.env.PENDING_PLAN_CHANGE_APPLY_LOOKAHEAD_MS ?? '', 10) || 30 * 60 * 1000;
 
 async function xxProcessPendingPlanChanges(): Promise<void> {
+  await xxActivateDuePendingPaidSubscriptions();
+
   const now = Date.now();
   const subscriptions = await XXSubscription.find({
     status: { $in: ['active', 'trialing', 'past_due'] },

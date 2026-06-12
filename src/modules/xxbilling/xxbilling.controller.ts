@@ -12,6 +12,7 @@ import {
 import {
   xxEvaluateSubscriptionAccess,
   xxGetEffectiveSubscriptionForUser,
+  xxGetPendingPaidSubscriptionForUser,
   xxIsPaddlePriceId,
   xxNotifyUser,
   xxPickEffectiveSubscription,
@@ -91,6 +92,37 @@ const subscriptionPayload = (sub: any, permanentPdfAccess = false, userPaddleSta
   };
 };
 
+const getActiveAndPendingBillingSubscriptions = async (userId: string) => {
+  const [activeSub, pendingPaidSub] = await Promise.all([
+    xxGetEffectiveSubscriptionForUser(userId, ['active', 'trialing', 'past_due']),
+    xxGetPendingPaidSubscriptionForUser(userId),
+  ]);
+
+  return { activeSub, pendingPaidSub };
+};
+
+const getRenewableBillingSubscription = async (userId: string) => {
+  const { activeSub, pendingPaidSub } = await getActiveAndPendingBillingSubscriptions(userId);
+  if (activeSub && !(activeSub as any).paddleSubscriptionId && pendingPaidSub) {
+    return { sub: pendingPaidSub, activeSub, isPendingPaid: true };
+  }
+  return { sub: activeSub, activeSub, isPendingPaid: false };
+};
+
+const mergePendingPaidIntoSubscriptionPayload = (payload: any, pendingPaidSub: any, permanentPdfAccess: boolean) => {
+  if (!payload || !pendingPaidSub) return payload;
+  const pendingPlan = toPublicPlan(pendingPaidSub.planTier, permanentPdfAccess);
+
+  return {
+    ...payload,
+    nextPlan: pendingPlan,
+    nextBillingCycle: pendingPaidSub.billingCycle,
+    hasScheduledPlanChange: true,
+    planChangeEffectiveAt: pendingPaidSub.activationDate ?? payload.currentPeriodEnd ?? null,
+    scheduledSubscription: subscriptionPayload(pendingPaidSub, permanentPdfAccess),
+  };
+};
+
 export const getPlans = async (_req: Request, res: Response) => {
   res.json({ success: true, plans: PLAN_DEFINITIONS });
 };
@@ -105,13 +137,23 @@ export const getSubscription = async (req: Request, res: Response) => {
     ]);
 
     const sub = xxPickEffectiveSubscription(subscriptions as any[], (userDoc as any)?.paddleSubscriptionId ?? null);
+    const pendingPaidSub = (subscriptions as any[]).find((candidate) =>
+      candidate?.status === 'pending' &&
+      candidate?.grantSource === 'paid' &&
+      !!candidate?.paddleSubscriptionId
+    );
     const access = xxEvaluateSubscriptionAccess(sub as any, (userDoc as any)?.subscriptionStatus ?? null);
     const tier: XXPlanTier = access.hasAccess ? ((sub as any)?.planTier ?? 'starter') : 'starter';
     const plan = toPublicPlan(tier, !!(userDoc as any)?.permanentPdfAccess);
+    const subscription = mergePendingPaidIntoSubscriptionPayload(
+      subscriptionPayload(sub, !!(userDoc as any)?.permanentPdfAccess, (userDoc as any)?.subscriptionStatus ?? null),
+      pendingPaidSub,
+      !!(userDoc as any)?.permanentPdfAccess,
+    );
 
     res.json({
       success: true,
-      subscription: subscriptionPayload(sub, !!(userDoc as any)?.permanentPdfAccess, (userDoc as any)?.subscriptionStatus ?? null),
+      subscription,
       plan,
       credits: (userDoc as any)?.credits ?? 0,
       usage: {
@@ -222,8 +264,14 @@ export const updateSubscription = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Invalid plan tier.' });
     }
 
-    const sub = await xxGetEffectiveSubscriptionForUser(userId, ['active', 'trialing', 'past_due']);
+    const { sub, isPendingPaid } = await getRenewableBillingSubscription(userId);
     if (!sub) return res.status(404).json({ success: false, message: 'No active subscription found.' });
+    if (!sub.paddleSubscriptionId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Complete checkout before scheduling a paid plan change.',
+      });
+    }
     if (sub.cancelDate || !sub.autoRenewEnabled) {
       return res.status(409).json({
         success: false,
@@ -232,20 +280,68 @@ export const updateSubscription = async (req: Request, res: Response) => {
       });
     }
 
-    const currentRenewalTier = sub.nextPlanTier ?? sub.planTier;
-    const currentRenewalCycle = sub.nextBillingCycle ?? sub.billingCycle;
+    const currentRenewalTier = isPendingPaid ? sub.planTier : (sub.nextPlanTier ?? sub.planTier);
+    const currentRenewalCycle = isPendingPaid ? sub.billingCycle : (sub.nextBillingCycle ?? sub.billingCycle);
     const targetPlan = getXXPlanDefinition(tier);
-    const effectiveAt = sub.nextBillingDate ?? sub.currentPeriodEnd ?? null;
+    const effectiveAt = isPendingPaid
+      ? (sub.activationDate ?? sub.nextBillingDate ?? sub.currentPeriodEnd ?? null)
+      : (sub.nextBillingDate ?? sub.currentPeriodEnd ?? null);
 
     if (currentRenewalTier === tier && currentRenewalCycle === billingCycle) {
       return res.json({
         success: true,
         syncedLocally: false,
-        changeTiming: (sub.nextPlanTier || sub.nextBillingCycle) ? 'next_billing_period' : 'none',
-        effectiveAt: (sub.nextPlanTier || sub.nextBillingCycle) ? effectiveAt : null,
+        changeTiming: isPendingPaid
+          ? 'pending_activation'
+          : ((sub.nextPlanTier || sub.nextBillingCycle) ? 'next_billing_period' : 'none'),
+        effectiveAt: isPendingPaid || sub.nextPlanTier || sub.nextBillingCycle ? effectiveAt : null,
         message: (sub.nextPlanTier || sub.nextBillingCycle)
           ? `Your renewal is already set to ${targetPlan.name} (${billingCycle}).`
-          : `You are already on ${targetPlan.name} (${billingCycle}).`,
+          : isPendingPaid
+            ? `Your scheduled subscription is already set to ${targetPlan.name} (${billingCycle}).`
+            : `You are already on ${targetPlan.name} (${billingCycle}).`,
+      });
+    }
+
+    if (isPendingPaid) {
+      await xxPatchPaddleSubscriptionPlan(sub.paddleSubscriptionId, tier, billingCycle);
+      await XXSubscription.findByIdAndUpdate((sub as any)._id, {
+        $set: {
+          planTier: tier,
+          billingCycle,
+          paddlePriceId: getXXPriceId(tier, billingCycle),
+          metadata: {
+            ...((sub as any).metadata ?? {}),
+            changedBeforeActivationAt: new Date(),
+          },
+        },
+        $unset: { nextPlanTier: '', nextBillingCycle: '' },
+      });
+
+      await Promise.all([
+        xxNotifyUser(userId, `Your scheduled subscription was changed to ${targetPlan.name} (${billingCycle}).`, {
+          tier,
+          billingCycle,
+          effectiveAt,
+        }),
+        xxLogBilling({
+          userId,
+          event: 'pending_subscription_changed',
+          source: 'api',
+          message: `Changed pending paid subscription to ${tier} (${billingCycle}).`,
+          paddleSubscriptionId: sub.paddleSubscriptionId,
+          metadata: { tier, billingCycle, effectiveAt },
+        }),
+      ]);
+
+      const effectiveAtText = formatBillingDate(effectiveAt);
+      return res.json({
+        success: true,
+        syncedLocally: true,
+        changeTiming: 'pending_activation',
+        effectiveAt,
+        message: `Scheduled subscription changed to ${targetPlan.name} (${billingCycle})${effectiveAtText ? ` for ${effectiveAtText}` : ' before activation'}.`,
+        paddleSubscriptionId: sub.paddleSubscriptionId,
       });
     }
 
@@ -292,7 +388,7 @@ export const updateSubscription = async (req: Request, res: Response) => {
 export const cancelSubscription = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
-    const sub = await xxGetEffectiveSubscriptionForUser(userId, ['active', 'trialing', 'past_due']);
+    const { sub, isPendingPaid } = await getRenewableBillingSubscription(userId);
     if (!sub) return res.status(404).json({ success: false, message: 'No active subscription found.' });
 
     let effectiveAt = sub.nextBillingDate ?? sub.currentPeriodEnd ?? new Date();
@@ -305,17 +401,30 @@ export const cancelSubscription = async (req: Request, res: Response) => {
     }
 
     await XXSubscription.findByIdAndUpdate((sub as any)._id, {
-      $set: { cancelDate: effectiveAt, autoRenewEnabled: false, autoRenewReminderStages: [] },
+      $set: {
+        cancelDate: effectiveAt,
+        autoRenewEnabled: false,
+        autoRenewReminderStages: [],
+        ...(isPendingPaid ? { status: 'cancelled' } : {}),
+      },
       $unset: { nextPlanTier: '', nextBillingCycle: '' },
     });
 
     await Promise.all([
-      xxNotifyUser(userId, 'Auto-renew is off. Any scheduled plan change was canceled.', { effectiveAt }),
+      xxNotifyUser(
+        userId,
+        isPendingPaid
+          ? 'Scheduled paid subscription canceled before activation. Your current access remains unchanged.'
+          : 'Auto-renew is off. Any scheduled plan change was canceled.',
+        { effectiveAt },
+      ),
       xxLogBilling({
         userId,
-        event: 'auto_renew_disabled',
+        event: isPendingPaid ? 'pending_subscription_cancelled' : 'auto_renew_disabled',
         source: 'api',
-        message: 'Auto-renew turned off and scheduled subscription change cleared.',
+        message: isPendingPaid
+          ? 'Pending paid subscription canceled before local activation.'
+          : 'Auto-renew turned off and scheduled subscription change cleared.',
         paddleSubscriptionId: sub.paddleSubscriptionId,
         metadata: { effectiveAt },
       }),
@@ -325,7 +434,9 @@ export const cancelSubscription = async (req: Request, res: Response) => {
     res.json({
       success: true,
       effectiveAt,
-      message: `Auto-renew turned off. Your subscription stays active${effectiveAtText ? ` until ${effectiveAtText}` : ' until the end of the current billing period'}. No next plan is scheduled.`,
+      message: isPendingPaid
+        ? `Scheduled paid subscription canceled${effectiveAtText ? ` effective ${effectiveAtText}` : ''}. Your current access remains unchanged.`
+        : `Auto-renew turned off. Your subscription stays active${effectiveAtText ? ` until ${effectiveAtText}` : ' until the end of the current billing period'}. No next plan is scheduled.`,
     });
   } catch (err: any) {
     const msg = err?.response?.data?.error?.detail || err?.message || 'Server error';
@@ -345,7 +456,7 @@ export const resumeSubscription = async (req: Request, res: Response) => resumeA
 export const resumeAutoRenew = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
-    const sub = await xxGetEffectiveSubscriptionForUser(userId, ['active', 'trialing', 'past_due']);
+    const { sub } = await getRenewableBillingSubscription(userId);
     if (!sub) return res.status(404).json({ success: false, message: 'No renewable subscription found.' });
     if (!sub.paddleSubscriptionId) {
       return res.status(400).json({ success: false, message: 'Subscription is not managed by Paddle.' });
@@ -377,10 +488,12 @@ export const resumeAutoRenew = async (req: Request, res: Response) => {
 };
 
 const portalSession = async (userId: string, focused: boolean) => {
-  const [sub, userDoc] = await Promise.all([
+  const [activeSub, pendingPaidSub, userDoc] = await Promise.all([
     xxGetEffectiveSubscriptionForUser(userId, ['active', 'trialing', 'paused', 'past_due', 'cancelled' as XXSubscriptionStatus]),
+    xxGetPendingPaidSubscriptionForUser(userId),
     User.findById(userId).select('paddleCustomerId').lean(),
   ]);
+  const sub = activeSub?.paddleSubscriptionId ? activeSub : (pendingPaidSub ?? activeSub);
   const paddleCustomerId = sub?.paddleCustomerId || (userDoc as any)?.paddleCustomerId;
   if (!paddleCustomerId) {
     const error: any = new Error('No Paddle customer record found. Please subscribe first.');
