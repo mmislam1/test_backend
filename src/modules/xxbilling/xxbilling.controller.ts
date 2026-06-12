@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { Search } from '../../models/searches';
 import { User } from '../../models/users';
 import { XXPayment } from '../../models/xxpayment';
+import { XXPlan } from '../../models/xxplan';
 import { XXSubscription, type XXSubscriptionStatus } from '../../models/xxsubscription';
 import type { XXBillingCycle, XXPlanTier } from '../../models/xxplan';
 import {
@@ -42,9 +43,59 @@ const monthUsage = async (userId: string) => {
 const toPublicPlan = (tier: XXPlanTier, permanentPdfAccess = false) => {
   const plan = getXXPlanDefinition(tier);
   return {
+    _id: tier,
+    id: tier,
     ...plan,
+    monthlyPrice: plan.pricing.monthly,
+    annualPrice: plan.pricing.annual,
+    annualTotal: plan.pricing.annualTotal,
+    annualDiscountPercent: plan.pricing.annualDiscountPercent,
+    paddleTrialPriceId: undefined,
     pdfEnabled: plan.pdfEnabled || permanentPdfAccess,
   };
+};
+
+const normalizeTier = (value: unknown): XXPlanTier | null => {
+  const tier = String(value ?? '').trim().toLowerCase();
+  return ['starter', 'pro', 'premium'].includes(tier) ? tier as XXPlanTier : null;
+};
+
+const normalizeBillingCycle = (value: unknown): XXBillingCycle =>
+  String(value ?? '').trim().toLowerCase() === 'annual' ? 'annual' : 'monthly';
+
+const resolvePlanRequest = async (body: any): Promise<{
+  tier: XXPlanTier | null;
+  billingCycle: XXBillingCycle;
+  priceId: string;
+}> => {
+  const billingCycle = normalizeBillingCycle(body?.billingCycle);
+  let tier =
+    normalizeTier(body?.tier) ??
+    normalizeTier(body?.planTier) ??
+    normalizeTier(body?.targetTier) ??
+    normalizeTier(body?.plan);
+  let priceId = String(body?.priceId ?? '').trim();
+  const planId = String(body?.planId ?? body?.targetPlanId ?? body?.subscriptionPlanId ?? '').trim();
+
+  if (!tier && planId) {
+    tier = normalizeTier(planId);
+
+    if (!tier && /^[a-f\d]{24}$/i.test(planId)) {
+      const planDoc = await XXPlan.findById(planId).select('tier paddleMonthlyPriceId paddleAnnualPriceId').lean();
+      tier = normalizeTier((planDoc as any)?.tier);
+      if (!priceId && planDoc) {
+        priceId = billingCycle === 'annual'
+          ? String((planDoc as any).paddleAnnualPriceId ?? '')
+          : String((planDoc as any).paddleMonthlyPriceId ?? '');
+      }
+    }
+  }
+
+  if (!priceId && tier) {
+    priceId = getXXPriceId(tier, billingCycle) ?? '';
+  }
+
+  return { tier, billingCycle, priceId };
 };
 
 const subscriptionPayload = (sub: any, permanentPdfAccess = false, userPaddleStatus?: string | null) => {
@@ -66,6 +117,7 @@ const subscriptionPayload = (sub: any, permanentPdfAccess = false, userPaddleSta
 
   return {
     id: sub._id,
+    _id: sub._id,
     status: access.effectiveStatus,
     paddleStatus: userPaddleStatus ?? null,
     hasAccess: access.hasAccess,
@@ -82,6 +134,7 @@ const subscriptionPayload = (sub: any, permanentPdfAccess = false, userPaddleSta
     cancelDate: sub.cancelDate,
     autoRenewEnabled: !!sub.autoRenewEnabled && !sub.cancelDate,
     nextPlan,
+    nextPlanId: nextPlan,
     nextBillingCycle,
     hasScheduledPlanChange,
     planChangeEffectiveAt: hasScheduledPlanChange
@@ -89,6 +142,7 @@ const subscriptionPayload = (sub: any, permanentPdfAccess = false, userPaddleSta
       : null,
     paddleManaged: !!sub.paddleSubscriptionId,
     plan: activePlan,
+    planId: activePlan,
   };
 };
 
@@ -124,7 +178,8 @@ const mergePendingPaidIntoSubscriptionPayload = (payload: any, pendingPaidSub: a
 };
 
 export const getPlans = async (_req: Request, res: Response) => {
-  res.json({ success: true, plans: PLAN_DEFINITIONS });
+  const plans = PLAN_DEFINITIONS.map((plan) => toPublicPlan(plan.tier));
+  res.json({ success: true, plans, data: plans });
 };
 
 export const getSubscription = async (req: Request, res: Response) => {
@@ -154,7 +209,9 @@ export const getSubscription = async (req: Request, res: Response) => {
     res.json({
       success: true,
       subscription,
+      data: subscription,
       plan,
+      currentPlan: plan,
       credits: (userDoc as any)?.credits ?? 0,
       usage: {
         imagesUsedThisMonth,
@@ -181,6 +238,13 @@ export const getPlanLimits = async (req: Request, res: Response) => {
 
     res.json({
       success: true,
+      data: {
+        tier,
+        alertLimit: plan.alertLimit,
+        imageUploadLimit: plan.imageUploadLimit,
+        pdfEnabled: plan.pdfEnabled,
+        permanentPdfAccess: !!(userDoc as any)?.permanentPdfAccess,
+      },
       tier,
       alertLimit: plan.alertLimit,
       imageUploadLimit: plan.imageUploadLimit,
@@ -195,18 +259,12 @@ export const getPlanLimits = async (req: Request, res: Response) => {
 export const createPaddleCheckout = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
-    const tier = String(req.body?.tier ?? '').toLowerCase() as XXPlanTier;
-    const billingCycle = (req.body?.billingCycle === 'annual' ? 'annual' : 'monthly') as XXBillingCycle;
-    let priceId = String(req.body?.priceId ?? '').trim();
+    const { tier, billingCycle, priceId } = await resolvePlanRequest(req.body);
 
     if (!priceId) {
-      if (!['starter', 'pro', 'premium'].includes(tier)) {
-        return res.status(400).json({ success: false, message: 'tier or priceId is required.' });
+      if (!tier) {
+        return res.status(400).json({ success: false, message: 'tier, planId, or priceId is required.' });
       }
-      priceId = getXXPriceId(tier, billingCycle) ?? '';
-    }
-
-    if (!priceId) {
       return res.status(404).json({
         success: false,
         message: `No Paddle price ID configured for plan "${tier}" (${billingCycle}).`,
@@ -246,7 +304,13 @@ export const createPaddleCheckout = async (req: Request, res: Response) => {
       metadata: { tier, billingCycle, priceId },
     });
 
-    res.json({ success: true, transactionId, checkoutUrl });
+    res.json({
+      success: true,
+      transactionId,
+      checkoutUrl,
+      url: checkoutUrl,
+      data: { transactionId, checkoutUrl, url: checkoutUrl },
+    });
   } catch (err: any) {
     const paddleError = err?.response?.data;
     const msg = paddleError?.error?.detail || paddleError?.error?.code || err?.message || 'Server error';
@@ -257,11 +321,10 @@ export const createPaddleCheckout = async (req: Request, res: Response) => {
 export const updateSubscription = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id as string;
-    const tier = String(req.body?.tier ?? '').toLowerCase() as XXPlanTier;
-    const billingCycle = (req.body?.billingCycle === 'annual' ? 'annual' : 'monthly') as XXBillingCycle;
+    const { tier, billingCycle } = await resolvePlanRequest(req.body);
 
-    if (!['starter', 'pro', 'premium'].includes(tier)) {
-      return res.status(400).json({ success: false, message: 'Invalid plan tier.' });
+    if (!tier) {
+      return res.status(400).json({ success: false, message: 'Invalid plan tier or planId.' });
     }
 
     const { sub, isPendingPaid } = await getRenewableBillingSubscription(userId);
@@ -290,6 +353,13 @@ export const updateSubscription = async (req: Request, res: Response) => {
     if (currentRenewalTier === tier && currentRenewalCycle === billingCycle) {
       return res.json({
         success: true,
+        data: {
+          syncedLocally: false,
+          changeTiming: isPendingPaid
+            ? 'pending_activation'
+            : ((sub.nextPlanTier || sub.nextBillingCycle) ? 'next_billing_period' : 'none'),
+          effectiveAt: isPendingPaid || sub.nextPlanTier || sub.nextBillingCycle ? effectiveAt : null,
+        },
         syncedLocally: false,
         changeTiming: isPendingPaid
           ? 'pending_activation'
@@ -337,6 +407,12 @@ export const updateSubscription = async (req: Request, res: Response) => {
       const effectiveAtText = formatBillingDate(effectiveAt);
       return res.json({
         success: true,
+        data: {
+          syncedLocally: true,
+          changeTiming: 'pending_activation',
+          effectiveAt,
+          paddleSubscriptionId: sub.paddleSubscriptionId,
+        },
         syncedLocally: true,
         changeTiming: 'pending_activation',
         effectiveAt,
@@ -371,6 +447,12 @@ export const updateSubscription = async (req: Request, res: Response) => {
     const effectiveAtText = formatBillingDate(effectiveAt);
     res.json({
       success: true,
+      data: {
+        syncedLocally: false,
+        changeTiming: 'next_billing_period',
+        effectiveAt,
+        paddleSubscriptionId: sub.paddleSubscriptionId,
+      },
       syncedLocally: false,
       changeTiming: 'next_billing_period',
       effectiveAt,
@@ -433,6 +515,7 @@ export const cancelSubscription = async (req: Request, res: Response) => {
     const effectiveAtText = formatBillingDate(effectiveAt);
     res.json({
       success: true,
+      data: { effectiveAt },
       effectiveAt,
       message: isPendingPaid
         ? `Scheduled paid subscription canceled${effectiveAtText ? ` effective ${effectiveAtText}` : ''}. Your current access remains unchanged.`
@@ -480,7 +563,11 @@ export const resumeAutoRenew = async (req: Request, res: Response) => {
       }),
     ]);
 
-    res.json({ success: true, message: 'Auto-renew resumed. Your subscription will renew at the next billing date.' });
+    res.json({
+      success: true,
+      message: 'Auto-renew resumed. Your subscription will renew at the next billing date.',
+      data: { message: 'Auto-renew resumed. Your subscription will renew at the next billing date.' },
+    });
   } catch (err: any) {
     const msg = err?.response?.data?.error?.detail || err?.message || 'Server error';
     res.status(xxIsPaddleNotFoundError(err) ? 409 : 500).json({ success: false, message: msg });
@@ -514,7 +601,7 @@ export const getUpdatePaymentUrl = async (req: Request, res: Response) => {
   try {
     const portalUrl = await portalSession(req.user?.id as string, true);
     if (!portalUrl) return res.status(500).json({ success: false, message: 'Could not retrieve portal URL from Paddle.' });
-    res.json({ success: true, portalUrl, updateUrl: portalUrl });
+    res.json({ success: true, portalUrl, updateUrl: portalUrl, data: { portalUrl, updateUrl: portalUrl } });
   } catch (err: any) {
     res.status(err?.statusCode || 500).json({ success: false, message: err?.message || 'Server error' });
   }
@@ -524,7 +611,7 @@ export const getBillingPortalUrl = async (req: Request, res: Response) => {
   try {
     const portalUrl = await portalSession(req.user?.id as string, false);
     if (!portalUrl) return res.status(500).json({ success: false, message: 'Could not retrieve billing portal URL from Paddle.' });
-    res.json({ success: true, portalUrl });
+    res.json({ success: true, portalUrl, data: { portalUrl } });
   } catch (err: any) {
     res.status(err?.statusCode || 500).json({ success: false, message: err?.message || 'Server error' });
   }
@@ -548,7 +635,13 @@ export const getBillingHistory = async (req: Request, res: Response) => {
     res.json({
       success: true,
       items,
+      payments: items,
       pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      data: {
+        items,
+        payments: items,
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      },
     });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err?.message || 'Server error' });
@@ -591,6 +684,13 @@ export const syncSubscriptionFromPaddle = async (req: Request, res: Response) =>
 
     res.json({
       success: true,
+      data: {
+        synced: true,
+        status: sub.status,
+        plan: sub.planTier,
+        billingCycle: sub.billingCycle,
+        paddleSubscriptionId: sub.paddleSubscriptionId,
+      },
       synced: true,
       status: sub.status,
       plan: sub.planTier,
