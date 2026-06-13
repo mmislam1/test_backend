@@ -7,6 +7,7 @@ import { getXXPlanDefinition, getXXPriceId } from './xxbilling.constants';
 import {
   xxApplyEntitlementsForSubscription,
   xxIsPaddlePriceId,
+  xxIsTierDowngrade,
   xxMapStatusToUserStatus,
   xxNotifyUser,
 } from './xxbilling.service';
@@ -131,6 +132,9 @@ const syncUserSubscriptionPointer = async (sub: IXXSubscription) => {
   });
 };
 
+/** Exported alias used by the trial-expiry worker to activate deferred subscriptions. */
+export const syncUserSubscriptionPointerFromWorker = syncUserSubscriptionPointer;
+
 export const xxPatchPaddleSubscriptionPlan = async (
   paddleSubscriptionId: string,
   tier: XXPlanTier,
@@ -205,13 +209,104 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
     periodEnd.getTime() > Date.now() + 60_000 &&
     !cancelDate;
 
+  // --- Downgrade-while-trialing guard ---
+  // If the user is on an active local trial and the incoming paid plan is a tier downgrade
+  // (e.g. bought Starter while trialling Pro), we must NOT cancel the trial immediately.
+  // Instead we store the Paddle subscription as 'deferred_trial_downgrade' so it activates
+  // automatically when the trial expires.
+  const activeLocalTrial = await XXSubscription.findOne({
+    userId,
+    status: { $in: ['active', 'trialing'] },
+    grantSource: { $in: ['trial', 'referral'] },
+    paddleSubscriptionId: { $exists: false },
+    currentPeriodEnd: { $gt: new Date() },
+  }).lean();
+
+  const isDowngradeWhileTrialing =
+    !!activeLocalTrial &&
+    !cancelDate &&
+    (status === 'active' || status === 'trialing') &&
+    xxIsTierDowngrade(activeLocalTrial.planTier as any, tier);
+
+  if (isDowngradeWhileTrialing) {
+    // Persist the Paddle subscription record but mark it as pending so it doesn't
+    // displace the running trial. We record deferredActivationDate = trial end so
+    // the trial-expiry worker knows when to flip it to active.
+    const deferredActivationDate = activeLocalTrial.currentPeriodEnd!;
+
+    const deferredSub = await XXSubscription.findOneAndUpdate(
+      { paddleSubscriptionId: data.id },
+      {
+        $set: {
+          userId,
+          planTier: tier,
+          billingCycle,
+          grantSource: 'paid',
+          status: 'pending',
+          activationDate: existing?.activationDate ?? (data.created_at ? new Date(data.created_at) : new Date()),
+          paddleSubscriptionId: data.id,
+          paddleCustomerId: data.customer_id,
+          paddlePriceId: String(priceId),
+          autoRenewEnabled: true,
+          deferredActivationDate,
+          ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
+        },
+        $unset: { cancelDate: '', trialEndDate: '', nextPlanTier: '', nextBillingCycle: '' },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+
+    await xxLogBilling({
+      userId,
+      event: 'paddle_subscription_deferred_downgrade',
+      source: 'paddle',
+      message: `Paid ${tier} (${billingCycle}) purchase deferred: user is trialling ${activeLocalTrial.planTier}. Will activate after trial ends on ${deferredActivationDate.toISOString()}.`,
+      paddleSubscriptionId: data.id,
+      metadata: { tier, billingCycle, trialTier: activeLocalTrial.planTier, deferredActivationDate },
+    });
+
+    await xxNotifyUser(
+      userId,
+      `Your ${getXXPlanDefinition(tier).name} plan purchase was successful. It will activate automatically when your current trial ends.`,
+      { tier, billingCycle, deferredActivationDate },
+    );
+
+    return deferredSub;
+  }
+  // --- End downgrade-while-trialing guard ---
+
+  // --- Same-tier or upgrade-while-trialing: add remaining trial days to the paid period ---
+  // If buying the same tier or upgrading while in an active local trial, we tack the
+  // remaining trial days onto the Paddle period so the user doesn't lose them.
+  const remainingTrialMs =
+    activeLocalTrial && !isDowngradeWhileTrialing && periodEnd
+      ? Math.max(0, activeLocalTrial.currentPeriodEnd!.getTime() - Date.now())
+      : 0;
+
+  const adjustedPeriodEnd =
+    remainingTrialMs > 0 && periodEnd
+      ? new Date(periodEnd.getTime() + remainingTrialMs)
+      : periodEnd;
+
+  if (remainingTrialMs > 0 && activeLocalTrial) {
+    const remainingDays = Math.ceil(remainingTrialMs / (24 * 60 * 60 * 1000));
+    await xxLogBilling({
+      userId,
+      event: 'trial_days_carried_forward',
+      source: 'paddle',
+      message: `User bought ${tier} while trialling ${activeLocalTrial.planTier}. Adding ${remainingDays} remaining trial day(s) to the paid period.`,
+      paddleSubscriptionId: data.id,
+      metadata: { tier, billingCycle, remainingDays, originalPeriodEnd: periodEnd, adjustedPeriodEnd },
+    });
+  }
+
   const sub = await XXSubscription.findOneAndUpdate(
     { paddleSubscriptionId: data.id },
     {
       $set: {
         userId,
-        planTier: shouldUseScheduledChange ? existing.planTier : tier,
-        billingCycle: shouldUseScheduledChange ? existing.billingCycle : billingCycle,
+        planTier: shouldUseScheduledChange ? existing!.planTier : tier,
+        billingCycle: shouldUseScheduledChange ? existing!.billingCycle : billingCycle,
         grantSource: status === 'trialing' ? 'trial' : 'paid',
         status,
         activationDate: existing?.activationDate ?? (data.created_at ? new Date(data.created_at) : new Date()),
@@ -219,13 +314,14 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
         paddleCustomerId: data.customer_id,
         paddlePriceId: String(priceId),
         autoRenewEnabled: !cancelDate && status !== 'cancelled',
-        ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
+        ...(adjustedPeriodEnd ? { currentPeriodEnd: adjustedPeriodEnd, nextBillingDate: adjustedPeriodEnd } : {}),
         ...(trialEnd ? { trialEndDate: trialEnd } : {}),
         ...(cancelDate ? { cancelDate } : {}),
         ...(!cancelDate ? { autoRenewReminderStages: [] } : {}),
         ...(!trialEnd ? { trialReminderStages: [] } : {}),
       },
       $unset: {
+        deferredActivationDate: '',
         ...(!shouldUseScheduledChange ? { nextPlanTier: '', nextBillingCycle: '' } : {}),
         ...(!cancelDate ? { cancelDate: '' } : {}),
         ...(!trialEnd ? { trialEndDate: '' } : {}),
@@ -236,6 +332,8 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
 
   await Promise.all([
     syncUserSubscriptionPointer(sub),
+    // Cancel any other active local subscriptions (trial or referral) for this user,
+    // since the paid plan is now live (same-tier or upgrade path).
     XXSubscription.updateMany(
       {
         userId,
@@ -254,9 +352,9 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
     userId,
     event: 'paddle_subscription_synced',
     source: 'paddle',
-    message: `Paddle subscription synced as ${status} on ${sub.planTier} (${sub.billingCycle}).`,
+    message: `Paddle subscription synced as ${status} on ${sub.planTier} (${sub.billingCycle}).${remainingTrialMs > 0 ? ` Trial days carried forward (period extended to ${adjustedPeriodEnd?.toISOString()}).` : ''}`,
     paddleSubscriptionId: data.id,
-    metadata: { tier, billingCycle, periodEnd, scheduledCancel: cancelDate },
+    metadata: { tier, billingCycle, periodEnd: adjustedPeriodEnd, scheduledCancel: cancelDate },
   });
 
   return sub;

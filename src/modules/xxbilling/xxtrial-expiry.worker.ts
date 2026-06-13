@@ -1,7 +1,9 @@
 import { User } from '../../models/users';
 import { XXSubscription } from '../../models/xxsubscription';
-import { xxNotifyUser } from './xxbilling.service';
+import { xxNotifyUser, xxApplyEntitlementsForSubscription } from './xxbilling.service';
 import { xxLogBilling } from './xxbilling.logger';
+import { getXXPlanDefinition } from './xxbilling.constants';
+import { syncUserSubscriptionPointerFromWorker } from './xxpaddle.service';
 
 const WORKER_INTERVAL_MS = parseInt(process.env.TRIAL_EXPIRY_INTERVAL_MS ?? '', 10) || 60 * 60 * 1000;
 
@@ -21,10 +23,6 @@ async function xxExpireTrials(): Promise<void> {
 
   await Promise.all([
     XXSubscription.updateMany({ _id: { $in: ids } }, { $set: { status: 'expired', autoRenewEnabled: false } }),
-    User.updateMany({ _id: { $in: userIds } }, { $set: { subscriptionId: null, subscriptionStatus: 'canceled' } }),
-    ...userIds.map((userId) =>
-      xxNotifyUser(userId, 'Your free access period has ended. Subscribe to continue using the service.'),
-    ),
     xxLogBilling({
       event: 'local_grants_expired',
       source: 'worker',
@@ -32,6 +30,54 @@ async function xxExpireTrials(): Promise<void> {
       metadata: { count: expired.length },
     }),
   ]);
+
+  // For each expired trial, check whether the user has a deferred Paddle subscription
+  // (purchased at a lower tier while trialling). If so, activate it now instead of
+  // pointing the user to a bare "subscribe" prompt.
+  for (const expiredSub of expired) {
+    const userId = String(expiredSub.userId);
+
+    const deferred = await XXSubscription.findOne({
+      userId,
+      status: 'pending',
+      paddleSubscriptionId: { $exists: true, $ne: null },
+      deferredActivationDate: { $lte: now },
+    });
+
+    if (deferred) {
+      // Activate the deferred paid subscription.
+      deferred.status = 'active';
+      deferred.activationDate = now;
+      (deferred as any).deferredActivationDate = undefined;
+      await deferred.save();
+
+      await syncUserSubscriptionPointerFromWorker(deferred);
+      await xxApplyEntitlementsForSubscription(deferred, 'deferred downgrade activation after trial');
+
+      const plan = getXXPlanDefinition(deferred.planTier);
+      await Promise.all([
+        xxNotifyUser(
+          userId,
+          `Your free trial has ended. Your ${plan.name} (${deferred.billingCycle}) plan is now active.`,
+          { tier: deferred.planTier, billingCycle: deferred.billingCycle },
+        ),
+        xxLogBilling({
+          userId,
+          event: 'deferred_downgrade_activated',
+          source: 'worker',
+          message: `Activated deferred ${deferred.planTier} (${deferred.billingCycle}) subscription after trial expiry.`,
+          paddleSubscriptionId: deferred.paddleSubscriptionId,
+          metadata: { tier: deferred.planTier, billingCycle: deferred.billingCycle },
+        }),
+      ]);
+    } else {
+      // No deferred subscription: user's access simply ends; prompt them to subscribe.
+      await Promise.all([
+        User.findByIdAndUpdate(userId, { $set: { subscriptionId: null, subscriptionStatus: 'canceled' } }),
+        xxNotifyUser(userId, 'Your free access period has ended. Subscribe to continue using the service.'),
+      ]);
+    }
+  }
 }
 
 export function startXXTrialExpiryWorker(): void {
