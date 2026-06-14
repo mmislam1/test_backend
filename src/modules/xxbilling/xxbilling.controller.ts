@@ -46,22 +46,87 @@ const toPublicPlan = (tier: XXPlanTier, permanentPdfAccess = false) => {
   };
 };
 
-const subscriptionPayload = (sub: any, permanentPdfAccess = false, userPaddleStatus?: string | null) => {
+const subscriptionPayload = (
+  sub: any,
+  permanentPdfAccess = false,
+  userPaddleStatus?: string | null,
+  deferredSub?: any | null,
+) => {
   if (!sub) return null;
 
   const access = xxEvaluateSubscriptionAccess(sub, userPaddleStatus);
   const activePlan = toPublicPlan(sub.planTier, permanentPdfAccess);
-  const nextPlanTier = sub.autoRenewEnabled ? (sub.nextPlanTier ?? sub.planTier) : null;
+
+  // --- Trial end date ---
+  // Local trials may have status 'trialing' OR 'active' (referral grants).
+  // xxEvaluateSubscriptionAccess only sets trialEndsAt when effectiveStatus === 'trialing',
+  // so we also check trialEndDate and currentPeriodEnd for any trial/referral grant.
+  const isTrial =
+    access.isTrialing ||
+    (access.grantSource === 'trial' && access.hasAccess) ||
+    (access.grantSource === 'referral' && access.hasAccess && !sub.paddleSubscriptionId);
+
+  const trialEndsAt: Date | null =
+    access.trialEndsAt ??                                                  // Paddle-managed trial
+    (isTrial
+      ? (sub.trialEndDate
+          ? new Date(sub.trialEndDate)
+          : sub.currentPeriodEnd
+            ? new Date(sub.currentPeriodEnd)
+            : null)
+      : null);
+
+  const trialDaysLeft = isTrial && trialEndsAt
+    ? Math.max(0, Math.ceil((trialEndsAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000)))
+    : 0;
+
+  // --- Renewal / billing dates ---
+  // For Paddle-managed subs: nextBillingDate is the renewal date.
+  // For trials (no Paddle): there is no renewal — access ends at trialEndsAt.
+  // cancelDate means auto-renew is off; access ends at cancelDate.
+  const autoRenewEnabled = !!sub.autoRenewEnabled && !sub.cancelDate;
+
+  // accessEndsAt: single unambiguous "when does your access stop?" field.
+  //   - auto-renew off → cancelDate
+  //   - trial (no paddle) → trialEndsAt
+  //   - paid with auto-renew → null (renews indefinitely unless cancelled)
+  const accessEndsAt: Date | null =
+    sub.cancelDate
+      ? new Date(sub.cancelDate)
+      : isTrial && !sub.paddleSubscriptionId
+        ? trialEndsAt
+        : null;
+
+  // renewsAt: next billing / renewal date for paid Paddle subs with auto-renew on.
+  const renewsAt: Date | null =
+    autoRenewEnabled && sub.paddleSubscriptionId
+      ? (sub.nextBillingDate ? new Date(sub.nextBillingDate) : sub.currentPeriodEnd ? new Date(sub.currentPeriodEnd) : null)
+      : null;
+
+  // --- Scheduled plan change ---
+  const nextPlanTier = autoRenewEnabled ? (sub.nextPlanTier ?? sub.planTier) : null;
   const nextPlan = nextPlanTier ? toPublicPlan(nextPlanTier, permanentPdfAccess) : null;
-  const nextBillingCycle = sub.autoRenewEnabled ? (sub.nextBillingCycle ?? sub.billingCycle ?? null) : null;
+  const nextBillingCycle = autoRenewEnabled ? (sub.nextBillingCycle ?? sub.billingCycle ?? null) : null;
   const hasScheduledPlanChange =
-    !!sub.autoRenewEnabled &&
+    autoRenewEnabled &&
     (!!sub.nextPlanTier || !!sub.nextBillingCycle) &&
     ((sub.nextPlanTier ?? sub.planTier) !== sub.planTier ||
       (sub.nextBillingCycle ?? sub.billingCycle) !== sub.billingCycle);
-  const trialDaysLeft = access.isTrialing && access.trialEndsAt
-    ? Math.max(0, Math.ceil((access.trialEndsAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000)))
-    : 0;
+
+  // --- Deferred downgrade (purchased lower-tier plan while trialling) ---
+  const pendingDowngrade = deferredSub
+    ? {
+        planTier: deferredSub.planTier,
+        billingCycle: deferredSub.billingCycle,
+        activatesAt: deferredSub.deferredActivationDate
+          ? new Date(deferredSub.deferredActivationDate)
+          : trialEndsAt,
+        currentPeriodEnd: deferredSub.currentPeriodEnd
+          ? new Date(deferredSub.currentPeriodEnd)
+          : null,
+        plan: toPublicPlan(deferredSub.planTier, permanentPdfAccess),
+      }
+    : null;
 
   return {
     id: sub._id,
@@ -70,22 +135,35 @@ const subscriptionPayload = (sub: any, permanentPdfAccess = false, userPaddleSta
     hasAccess: access.hasAccess,
     billingCycle: sub.billingCycle,
     grantSource: access.grantSource,
-    isTrial: access.isTrialing || (access.grantSource === 'trial' && access.hasAccess),
-    isTrialing: access.isTrialing,
-    isPastDue: access.effectiveStatus === 'past_due',
-    trialEndsAt: access.trialEndsAt,
+
+    // Trial fields
+    isTrial,
+    isTrialing: access.isTrialing || (isTrial && !sub.paddleSubscriptionId),
+    trialEndsAt,
     trialDaysLeft,
+
+    isPastDue: access.effectiveStatus === 'past_due',
     activationDate: sub.activationDate,
     currentPeriodEnd: sub.currentPeriodEnd,
     nextBillingDate: sub.nextBillingDate,
     cancelDate: sub.cancelDate,
-    autoRenewEnabled: !!sub.autoRenewEnabled && !sub.cancelDate,
+    autoRenewEnabled,
+
+    // Clear, unambiguous date fields for the UI
+    accessEndsAt,
+    renewsAt,
+
+    // Scheduled renewal plan change
     nextPlan,
     nextBillingCycle,
     hasScheduledPlanChange,
     planChangeEffectiveAt: hasScheduledPlanChange
       ? (sub.nextBillingDate ?? sub.currentPeriodEnd ?? null)
       : null,
+
+    // Deferred downgrade purchased during trial
+    pendingDowngrade,
+
     paddleManaged: !!sub.paddleSubscriptionId,
     plan: activePlan,
   };
@@ -100,7 +178,7 @@ export const getSubscription = async (req: Request, res: Response) => {
     const userId = req.user?.id as string;
     const [subscriptions, userDoc, imagesUsedThisMonth] = await Promise.all([
       XXSubscription.find({ userId }).sort({ activationDate: -1, createdAt: -1 }).lean(),
-      User.findById(userId).select('permanentPdfAccess credits subscriptionStatus paddleSubscriptionId').lean(),
+      User.findById(userId).select('permanentPdfAccess credits subscriptionStatus paddleSubscriptionId alertsRemaining').lean(),
       monthUsage(userId),
     ]);
 
@@ -109,11 +187,35 @@ export const getSubscription = async (req: Request, res: Response) => {
     const tier: XXPlanTier = access.hasAccess ? ((sub as any)?.planTier ?? 'starter') : 'starter';
     const plan = toPublicPlan(tier, !!(userDoc as any)?.permanentPdfAccess);
 
+    // If the effective subscription is a local trial, look for a deferred paid downgrade
+    // that is waiting to activate after the trial ends. Surfaced as `pendingDowngrade` in
+    // the payload so the UI can inform the user what plan kicks in after their trial.
+    const isLocalTrial =
+      !!sub &&
+      !(sub as any).paddleSubscriptionId &&
+      ((sub as any).grantSource === 'trial' || (sub as any).grantSource === 'referral') &&
+      access.hasAccess;
+
+    const deferredSub = isLocalTrial
+      ? (subscriptions as any[]).find(
+          (s) =>
+            s.status === 'pending' &&
+            s.paddleSubscriptionId &&
+            s.deferredActivationDate,
+        ) ?? null
+      : null;
+
     res.json({
       success: true,
-      subscription: subscriptionPayload(sub, !!(userDoc as any)?.permanentPdfAccess, (userDoc as any)?.subscriptionStatus ?? null),
+      subscription: subscriptionPayload(
+        sub,
+        !!(userDoc as any)?.permanentPdfAccess,
+        (userDoc as any)?.subscriptionStatus ?? null,
+        deferredSub,
+      ),
       plan,
       credits: (userDoc as any)?.credits ?? 0,
+      alertsRemaining: (userDoc as any)?.alertsRemaining ?? 0,
       usage: {
         imagesUsedThisMonth,
         imageUploadLimit: plan.imageUploadLimit,
