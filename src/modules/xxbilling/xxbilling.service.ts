@@ -180,9 +180,12 @@ export const xxGrantEntitlements = async (
     if (alreadyGranted) return;
   }
 
+  // alertLimit === 0 is the "unlimited" sentinel in plan definitions.
+  // topUpAlerts expects -1 for unlimited; pass it through correctly.
+  const alertQuota = plan.alertLimit === 0 ? -1 : plan.alertLimit;
   await Promise.all([
     topUpCredits(userId, plan.imageUploadLimit),
-    topUpAlerts(userId, plan.alertLimit),
+    topUpAlerts(userId, alertQuota),
   ]);
 };
 

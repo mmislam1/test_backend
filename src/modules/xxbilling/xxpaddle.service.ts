@@ -195,10 +195,24 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
   const scheduledCancel = data.scheduled_change?.action === 'cancel' && data.scheduled_change?.effective_at
     ? new Date(data.scheduled_change.effective_at)
     : undefined;
-  const cancelDate = scheduledCancel
+
+  // For a pending deferred subscription that gets cancelled by Paddle, Paddle's
+  // effective_at / canceled_at is the purchase-anchored period end — which doesn't
+  // account for the trial gap. We use the locally-stored currentPeriodEnd
+  // (already adjusted for the trial gap) if it is later than what Paddle reports.
+  const rawCancelDate = scheduledCancel
     ?? (incomingStatus === 'cancelled'
       ? (data.canceled_at ? new Date(data.canceled_at) : new Date())
       : undefined);
+
+  let cancelDate = rawCancelDate;
+  if (rawCancelDate && existing?.deferredActivationDate && existing?.currentPeriodEnd) {
+    // Prefer the locally-adjusted period end if it is later (user is entitled to the
+    // full deferred period, not just what Paddle's clock says).
+    if (existing.currentPeriodEnd.getTime() > rawCancelDate.getTime()) {
+      cancelDate = existing.currentPeriodEnd;
+    }
+  }
 
   const existing = await XXSubscription.findOne({ paddleSubscriptionId: data.id });
   const status = incomingStatus;
@@ -234,6 +248,19 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
     // the trial-expiry worker knows when to flip it to active.
     const deferredActivationDate = activeLocalTrial.currentPeriodEnd!;
 
+    // Paddle's periodEnd is anchored to the purchase date. Once the deferred sub
+    // activates (at trialEnd), the user's effective access end is:
+    //   trialEnd + (Paddle billingPeriod length)
+    // We compute this now and store it as currentPeriodEnd so cancelDate is correct
+    // if the user later turns off auto-renew.
+    const paddlePeriodLengthMs =
+      periodEnd && data.created_at
+        ? periodEnd.getTime() - new Date(data.created_at).getTime()
+        : billingCycle === 'annual'
+          ? 365 * 24 * 60 * 60 * 1000
+          : 30 * 24 * 60 * 60 * 1000;
+    const effectivePeriodEnd = new Date(deferredActivationDate.getTime() + paddlePeriodLengthMs);
+
     const deferredSub = await XXSubscription.findOneAndUpdate(
       { paddleSubscriptionId: data.id },
       {
@@ -247,9 +274,11 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
           paddleSubscriptionId: data.id,
           paddleCustomerId: data.customer_id,
           paddlePriceId: String(priceId),
-          autoRenewEnabled: true,
+          autoRenewEnabled: !cancelDate,
           deferredActivationDate,
-          ...(periodEnd ? { currentPeriodEnd: periodEnd, nextBillingDate: periodEnd } : {}),
+          // Store the trial-gap-adjusted period end so cancelDate is correct downstream.
+          currentPeriodEnd: effectivePeriodEnd,
+          nextBillingDate: effectivePeriodEnd,
         },
         $unset: { cancelDate: '', trialEndDate: '', nextPlanTier: '', nextBillingCycle: '' },
       },

@@ -46,9 +46,11 @@ async function xxExpireTrials(): Promise<void> {
 
     if (deferred) {
       // Activate the deferred paid subscription.
+      // currentPeriodEnd was already stored as (trialEnd + billingPeriodLength) during
+      // the deferred upsert, so it is already correct — no recalculation needed.
       deferred.status = 'active';
       deferred.activationDate = now;
-      (deferred as any).deferredActivationDate = undefined;
+      deferred.deferredActivationDate = undefined;
       await deferred.save();
 
       await syncUserSubscriptionPointerFromWorker(deferred);
