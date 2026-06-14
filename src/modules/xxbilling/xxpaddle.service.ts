@@ -200,6 +200,7 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
   // effective_at / canceled_at is the purchase-anchored period end — which doesn't
   // account for the trial gap. We use the locally-stored currentPeriodEnd
   // (already adjusted for the trial gap) if it is later than what Paddle reports.
+  const existing = await XXSubscription.findOne({ paddleSubscriptionId: data.id });
   const rawCancelDate = scheduledCancel
     ?? (incomingStatus === 'cancelled'
       ? (data.canceled_at ? new Date(data.canceled_at) : new Date())
@@ -214,7 +215,7 @@ export const xxSyncSubscriptionFromPaddlePayload = async (
     }
   }
 
-  const existing = await XXSubscription.findOne({ paddleSubscriptionId: data.id });
+  
   const status = incomingStatus;
   const shouldUseScheduledChange =
     !!existing?.nextPlanTier &&

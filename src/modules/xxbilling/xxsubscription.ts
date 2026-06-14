@@ -1,5 +1,5 @@
 import mongoose, { Schema, Document, Types } from 'mongoose';
-import type { XXBillingCycle, XXPlanTier } from './xxplan';
+import type { XXBillingCycle, XXPlanTier } from '../../models/xxplan';
 
 export type XXSubscriptionStatus =
   | 'active'
